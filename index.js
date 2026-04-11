@@ -530,7 +530,7 @@ bot.on('callback_query', async (query) => {
     else if (action === 'cmd_hunt_wa') {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ Kamu belum login IVAS!", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
         const acc = activeSessions.get(chatId);
-        const MAX_BUY = 5; 
+        const MAX_BUY = 4; 
         await safeEditMessageText(`🎯 *AUTO-SNIPER WA AKTIF*\nBot akan memonitor Live Feed, mencari Range WA yang gacor, dan *otomatis menambahkan* 1 Range dari setiap temuan.\n\n_Maksimal target: ${MAX_BUY} Range. Harap tunggu..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
         const uniqueRanges = new Set();
