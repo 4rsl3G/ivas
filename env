@@ -1,3 +1,15 @@
-TELEGRAM_BOT_TOKEN=
-POLLING_INTERVAL=60000
-BROADCAST_CHANNEL_ID=
+# Token Bot Telegram (Didapat dari @BotFather)
+TELEGRAM_BOT_TOKEN=masukkan_token_bot_kamu_di_sini
+
+# ID Channel Telegram untuk Broadcast OTP (Harus diawali -100, dan bot WAJIB jadi Admin)
+BROADCAST_CHANNEL_ID=-1002957498552
+
+# ID Chat Pribadi Admin (Untuk mengunci akses menu rahasia seperti "Hubungkan WA")
+ADMIN_CHAT_ID=6649507567
+
+# Interval Polling Cek OTP Otomatis dalam milidetik (30000 = 30 detik)
+POLLING_INTERVAL=30000
+
+# Username Bot Telegram kamu TANPA @ (Contoh: PansaStudio_Bot). 
+# Ini digunakan untuk link tombol "Kembali ke Panel" di Channel
+BOT_USERNAME=username_bot_kamu
