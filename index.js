@@ -285,7 +285,7 @@ async function runFullFlow(chatId) {
   }
 }
 
-// ─── COMMANDS (DIUBAH MENJADI /\/command/) ────────────────────────────────────
+// ─── COMMANDS ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   await sendMsg(msg.chat.id,
     `🤖 *iVAS Automation Bot*\n\n` +
@@ -377,14 +377,18 @@ bot.onText(/\/returnnumbers/, async (msg) => {
   await sendMsg(msg.chat.id, `✅ ${escMd(res.message || 'Berhasil')}`);
 });
 
-bot.onText(/\/setcookie (.+)/, async (msg, match) => {
+// ─── PERBAIKAN COMMAND /setcookie ─────────────────────────────────────────────
+bot.onText(/\/setcookie ([\s\S]+)/, async (msg, match) => {
   try {
-    const cookieStr = match[1].trim();
+    // Ubah baris baru (enter) menjadi titik koma (;) agar tetap bisa di-split dengan benar
+    const cookieStr = match[1].replace(/\n/g, '; ').trim();
     const cookieObj = {};
+    
     cookieStr.split(';').forEach(p => {
       const [k, ...v] = p.trim().split('=');
       if (k) cookieObj[k.trim()] = v.join('=').trim();
     });
+    
     saveCookie(cookieObj, cookieStr);
     await sendMsg(msg.chat.id, '✅ Cookie berhasil disimpan\\!');
   } catch (e) {
