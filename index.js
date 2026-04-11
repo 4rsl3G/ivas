@@ -27,7 +27,7 @@ function isAdmin(chatId) {
 }
 
 // ==========================================
-// SETUP DATABASE SQLITE (MURNI TANPA JSON LAMA)
+// SETUP DATABASE
 // ==========================================
 const sqlDb = new sqlite3.Database('./pansa_bot.db');
 
@@ -222,7 +222,6 @@ class IVASAccount {
 
 const activeSessions = new Map();
 
-// [PERBAIKAN] Fungsi Inisialisasi Sesi kini murni mengambil dari SQLite
 async function startIvasSession(chatId) {
     try {
         const session = await dbGet('SELECT cookies FROM sessions WHERE chat_id = ?', [chatId]);
@@ -289,10 +288,8 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     });
 }
 
-// [PERBAIKAN] Mencegah Dead-End UI jika nomor kosong atau WA Off
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) {
-        // Jika belum punya nomor sama sekali, tidak perlu error, tampilkan success lalu kembalikan menu
         await safeEditMessageText(`✅ *Aksi Berhasil*\nSistem telah disinkronkan, namun tidak ada nomor di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
@@ -303,7 +300,6 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
             await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
         }
         await delay(2000);
-        // Tampilkan Menu lagi setelah selesai save tanpa WA
         await safeEditMessageText(`✅ *Selesai!* ${numbersObjArray.length} nomor tersimpan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
@@ -351,11 +347,11 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
 
 const getMainMenuMarkup = () => ({
     inline_keyboard: [
-        [{ text: '🔑 Login Cookie', callback_data: 'cmd_login' }, { text: '🗃 Sync Data (Filter WA)', callback_data: 'cmd_sync_db' }],
-        [{ text: '🔍 Cek Inbox (Nomor)', callback_data: 'cmd_search' }, { text: '🛒 Cari Range (Add)', callback_data: 'cmd_search_range' }],
-        [{ text: '📡 AUTO-SNIPER WA', callback_data: 'cmd_hunt_wa' }, { text: '🗑 Hapus Semua', callback_data: 'cmd_delete_all' }],
-        [{ text: '📱 Hubungkan WA', callback_data: 'cmd_wa_login' }, { text: '⚙️ Status Sistem', callback_data: 'cmd_status' }],
-        [{ text: '🚪 Logout IVAS', callback_data: 'cmd_logout' }]
+        [{ text: '🔑 Login Cookie', callback_data: 'cmd_login' }, { text: '🗃 Sync Data', callback_data: 'cmd_sync_db' }],
+        [{ text: '🔍 Cek Inbox', callback_data: 'cmd_search' }, { text: '🛒 Cari Range', callback_data: 'cmd_search_range' }],
+        [{ text: '📡 AUTO-SNIPER WA', callback_data: 'cmd_hunt_wa' }, { text: '📱 Ambil Nomor WA', callback_data: 'cmd_get_wa_numbers_0' }],
+        [{ text: '🔗 Hubungkan WA', callback_data: 'cmd_wa_login' }, { text: '⚙️ Status Sistem', callback_data: 'cmd_status' }],
+        [{ text: '🗑 Hapus Semua', callback_data: 'cmd_delete_all' }, { text: '🚪 Logout IVAS', callback_data: 'cmd_logout' }]
     ]
 });
 
@@ -454,6 +450,47 @@ bot.on('callback_query', async (query) => {
             await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
         } else {
             safeEditMessageText(`✅ *Sync Selesai!*\nTidak ada nomor aktif di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
+    }
+    // [FITUR BARU] GET NOMOR (PAGINATION)
+    else if (action.startsWith('cmd_get_wa_numbers_')) {
+        const offset = parseInt(action.replace('cmd_get_wa_numbers_', '')) || 0;
+        const limit = 3;
+
+        try {
+            const countRow = await dbGet('SELECT COUNT(*) as count FROM wa_numbers WHERE chat_id = ?', [chatId]);
+            const total = countRow.count;
+
+            if (total === 0) {
+                return safeEditMessageText("❌ *Data Kosong*\nBelum ada nomor WA aktif yang tersimpan di Database.\n\n_Silakan gunakan fitur Sync Data atau Auto-Sniper terlebih dahulu._", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+            }
+
+            // Looping ke awal jika sudah habis
+            const currentOffset = offset >= total ? 0 : offset;
+
+            const numbers = await dbAll('SELECT number, range_name FROM wa_numbers WHERE chat_id = ? LIMIT ? OFFSET ?', [chatId, limit, currentOffset]);
+
+            let text = `📱 *NOMOR WA AKTIF TERSIMPAN*\nMenampilkan ${currentOffset + 1} - ${Math.min(currentOffset + limit, total)} dari total *${total}* nomor.\n\n💡 _Tap nomor di bawah untuk menyalin (Copy):_\n\n`;
+            
+            const inline_keyboard = [];
+            
+            numbers.forEach((n, i) => {
+                text += `${currentOffset + i + 1}. 🌍 *${n.range_name}*\n   └ 📱 \`${n.number}\`\n\n`;
+                inline_keyboard.push([{ text: `📋 Copy: ${n.number}`, callback_data: 'dummy_btn' }]);
+            });
+
+            const navButtons = [];
+            if (total > limit) {
+                const nextOffset = currentOffset + limit;
+                navButtons.push({ text: '🔄 Ganti Nomor', callback_data: `cmd_get_wa_numbers_${nextOffset}` });
+            }
+            navButtons.push({ text: '⬅️ Kembali', callback_data: 'cmd_cancel' });
+            
+            inline_keyboard.push(navButtons);
+
+            safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard } });
+        } catch (e) {
+            safeEditMessageText(`⚠️ Error mengambil data: ${e.message}`, { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
         }
     }
     else if (action === 'cmd_search_range') {
