@@ -11,7 +11,12 @@ require('dotenv').config();
 
 // --- KONFIGURASI ENV ---
 const token = process.env.TELEGRAM_BOT_TOKEN;
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(token, { 
+    polling: true,
+    request: {
+        family: 4 // Memaksa bot menggunakan IPv4
+    }
+});
 const POLLING_INTERVAL = process.env.POLLING_INTERVAL || 30000;
 const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL_ID ? process.env.BROADCAST_CHANNEL_ID.trim() : null;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? process.env.ADMIN_CHAT_ID.trim() : null; 
