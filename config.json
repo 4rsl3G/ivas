@@ -1,0 +1,27 @@
+{
+  "telegram_token": "ISI_TOKEN_BOT_TELEGRAM_KAMU",
+  "chat_id": "ISI_CHAT_ID_KAMU",
+  "cron_enabled": true,
+  "cron_schedule": "0 8 * * *",
+
+  "advanced_settings": {
+    "timezone": "Asia/Jakarta",
+    "monitor_interval_ms": 30000,
+    "api_timeout_ms": 30000,
+    "max_retries": 3,
+    "allowed_admins": [
+      "ISI_CHAT_ID_KAMU",
+      "CHAT_ID_ADMIN_LAIN_JIKA_ADA"
+    ]
+  },
+
+  "notes": {
+    "cron_schedule_examples": {
+      "setiap_hari_jam_8_pagi": "0 8 * * *",
+      "setiap_12_jam": "0 */12 * * *",
+      "setiap_30_menit": "*/30 * * * *",
+      "setiap_hari_jam_8_dan_20": "0 8,20 * * *"
+    },
+    "security_warning": "JANGAN pernah commit file ini ke public repository (seperti GitHub/GitLab publik) karena berisi token rahasia!"
+  }
+}
