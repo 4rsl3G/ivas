@@ -27,7 +27,7 @@ function isAdmin(chatId) {
 }
 
 // ==========================================
-// SETUP DATABASE
+// SETUP DATABASE SQLITE (MURNI TANPA JSON LAMA)
 // ==========================================
 const sqlDb = new sqlite3.Database('./pansa_bot.db');
 
@@ -222,6 +222,22 @@ class IVASAccount {
 
 const activeSessions = new Map();
 
+// [PERBAIKAN] Fungsi Inisialisasi Sesi kini murni mengambil dari SQLite
+async function startIvasSession(chatId) {
+    try {
+        const session = await dbGet('SELECT cookies FROM sessions WHERE chat_id = ?', [chatId]);
+        if (session && session.cookies) {
+            const cookiesObj = JSON.parse(session.cookies);
+            const account = new IVASAccount(chatId, cookiesObj);
+            if (await account.initSession()) {
+                activeSessions.set(chatId, account);
+                return true;
+            }
+        }
+    } catch (error) { console.error('[System] Error startIvasSession:', error); }
+    return false;
+}
+
 // ==========================================
 // MODUL 2: WHATSAPP BAILEYS & AUTO-FILTER DB
 // ==========================================
@@ -273,8 +289,13 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     });
 }
 
+// [PERBAIKAN] Mencegah Dead-End UI jika nomor kosong atau WA Off
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
-    if (!numbersObjArray || numbersObjArray.length === 0) return;
+    if (!numbersObjArray || numbersObjArray.length === 0) {
+        // Jika belum punya nomor sama sekali, tidak perlu error, tampilkan success lalu kembalikan menu
+        await safeEditMessageText(`✅ *Aksi Berhasil*\nSistem telah disinkronkan, namun tidak ada nomor di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        return;
+    }
 
     if (!sock?.authState?.creds?.registered) {
         await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter status WhatsApp...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
@@ -282,6 +303,8 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
             await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
         }
         await delay(2000);
+        // Tampilkan Menu lagi setelah selesai save tanpa WA
+        await safeEditMessageText(`✅ *Selesai!* ${numbersObjArray.length} nomor tersimpan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
 
@@ -408,7 +431,12 @@ bot.on('callback_query', async (query) => {
             const acc = activeSessions.get(chatId);
             const myNumbers = await acc.getMyNumbers();
             await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
-            await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
+            
+            if (myNumbers.length > 0) {
+                await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
+            } else {
+                safeEditMessageText(`✅ *Login IVAS Berhasil!*\nNamun belum ada nomor aktif di akun kamu.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+            }
         } else {
             safeEditMessageText("❌ *Login Gagal!* Cookie mungkin kadaluarsa.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         }
@@ -421,7 +449,12 @@ bot.on('callback_query', async (query) => {
         const myNumbers = await acc.getMyNumbers();
         
         await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
-        await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
+        
+        if(myNumbers.length > 0) {
+            await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
+        } else {
+            safeEditMessageText(`✅ *Sync Selesai!*\nTidak ada nomor aktif di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
     }
     else if (action === 'cmd_search_range') {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ Kamu belum login IVAS!", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
