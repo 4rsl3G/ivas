@@ -21,12 +21,16 @@ const POLLING_INTERVAL = process.env.POLLING_INTERVAL || 30000;
 const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL_ID ? process.env.BROADCAST_CHANNEL_ID.trim() : null;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? process.env.ADMIN_CHAT_ID.trim() : null; 
 
+// --- FUNGSI PROTEKSI ADMIN ---
+function isAdmin(chatId) {
+    return ADMIN_CHAT_ID && chatId.toString() === ADMIN_CHAT_ID;
+}
+
 // ==========================================
-// SETUP SQLITE DATABASE
+// SETUP DATABASE
 // ==========================================
 const sqlDb = new sqlite3.Database('./pansa_bot.db');
 
-// Helper untuk menggunakan Promises di SQLite
 const dbRun = (sql, params = []) => new Promise((res, rej) => sqlDb.run(sql, params, function(err) { if(err) rej(err); else res(this); }));
 const dbGet = (sql, params = []) => new Promise((res, rej) => sqlDb.get(sql, params, (err, row) => err ? rej(err) : res(row)));
 const dbAll = (sql, params = []) => new Promise((res, rej) => sqlDb.all(sql, params, (err, rows) => err ? rej(err) : res(rows)));
@@ -84,6 +88,19 @@ class IVASAccount {
             const res = await this.client.get(`/portal/numbers?${params.toString()}`, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
             if (res.status === 200 && res.data && res.data.data) {
                 return res.data.data.map(item => ({ number: item.Number.toString(), range: item.range }));
+            }
+            return [];
+        } catch (e) { return []; }
+    }
+
+    async getLiveNumbers(terminationId) {
+        try {
+            const payload = new URLSearchParams({ '_token': this.csrfToken, 'termination_id': terminationId });
+            const res = await this.client.post('/portal/live/getNumbers', payload.toString(), {
+                headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }
+            });
+            if (res.status === 200 && Array.isArray(res.data)) {
+                return res.data.map(item => item.Number.toString());
             }
             return [];
         } catch (e) { return []; }
@@ -256,7 +273,6 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     });
 }
 
-// [MESIN PINTAR SQLITE] Otomatis Cek WA & Masukkan ke DB
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) return;
 
@@ -279,7 +295,7 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
         processed++;
         const jid = `${n.number}@s.whatsapp.net`;
         try {
-            await delay(250); // Jeda anti-banned
+            await delay(250); 
             const [status] = await sock.onWhatsApp(jid);
             if (status?.exists) {
                 await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
@@ -294,9 +310,8 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     await safeEditMessageText(`✅ *Filter WA Selesai!*\nTotal Ditarik: ${total}\n📲 Aktif WA (Disimpan): *${activeCount}* Nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 }
 
-// Inisialisasi Booting
 (async () => {
-    console.log('[SYSTEM] Menyiapkan SQLite & Ivasms Sessions...');
+    console.log('[SYSTEM] Menyiapkan Database & Ivasms Sessions...');
     const sessions = await dbAll('SELECT * FROM sessions');
     for (const session of sessions) {
         const account = new IVASAccount(session.chat_id, JSON.parse(session.cookies));
@@ -341,6 +356,9 @@ async function safeEditMessageText(text, options) {
 bot.onText(/\/(start|menu)/, async (msg) => {
     const chatId = msg.chat.id.toString();
     bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+    
+    if (!isAdmin(chatId)) return bot.sendMessage(chatId, "⛔ Anda tidak memiliki akses ke bot ini.");
+    
     const sentMsg = await bot.sendMessage(chatId, `*🤖 Panel Universal Pansa AI*\nManajemen Ivasms & WA Bulk Checker\n\nSilakan pilih menu di bawah ini:`, { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     userStates[chatId] = { state: 'IDLE', lastMsgId: sentMsg.message_id };
 });
@@ -351,13 +369,50 @@ bot.on('callback_query', async (query) => {
     const action = query.data;
 
     bot.answerCallbackQuery(query.id);
+    
+    if (!isAdmin(chatId)) {
+        return bot.answerCallbackQuery(query.id, { text: "⛔ Akses ditolak.", show_alert: true });
+    }
+
     if (action === 'dummy_btn') return; 
     if (!userStates[chatId]) userStates[chatId] = { state: 'IDLE', lastMsgId: msgId };
 
     if (action === 'cmd_login') {
         userStates[chatId].state = 'WAITING_COOKIE';
-        safeEditMessageText("🔑 *Update Cookie IVAS*\nKirimkan *JSON Object* cookie kamu di sini.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
+        userStates[chatId].tempCookies = {};
+        
+        const markup = {
+            inline_keyboard: [
+                [{ text: '✅ Selesai & Login', callback_data: 'cmd_finish_login' }],
+                [{ text: '❌ Batal', callback_data: 'cmd_cancel' }]
+            ]
+        };
+        safeEditMessageText("🔑 *Update Cookie IVAS*\nKirim cookie kamu satu per satu dengan format:\n`nama=nilai`\n\nContoh: `ivas_sms_session=eyJp...`", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: markup });
     } 
+    else if (action === 'cmd_finish_login') {
+        if (!userStates[chatId] || !userStates[chatId].tempCookies) return;
+        const cookiesObj = userStates[chatId].tempCookies;
+        
+        if (!cookiesObj['ivas_sms_session']) {
+            const markup = { inline_keyboard: [[{ text: '❌ Batal', callback_data: 'cmd_cancel' }]] };
+            return safeEditMessageText("❌ Cookie `ivas_sms_session` wajib ditambahkan!\nSilakan kirimkan format `ivas_sms_session=nilai`.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: markup });
+        }
+
+        userStates[chatId].state = 'IDLE';
+        await safeEditMessageText("⏳ Login IVAS...", { chat_id: chatId, message_id: msgId });
+        
+        await dbRun('INSERT OR REPLACE INTO sessions (chat_id, cookies, last_total_sms) VALUES (?, ?, ?)', [chatId, JSON.stringify(cookiesObj), -1]);
+        const success = await startIvasSession(chatId);
+        
+        if (success) {
+            const acc = activeSessions.get(chatId);
+            const myNumbers = await acc.getMyNumbers();
+            await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
+            await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
+        } else {
+            safeEditMessageText("❌ *Login Gagal!* Cookie mungkin kadaluarsa.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
+    }
     else if (action === 'cmd_sync_db') {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ Kamu belum login IVAS!", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
         safeEditMessageText("⏳ *Sedang Menarik Data Nomor...*\nMengambil daftar nomor aktif dari API Ivasms...", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
@@ -365,10 +420,7 @@ bot.on('callback_query', async (query) => {
         const acc = activeSessions.get(chatId);
         const myNumbers = await acc.getMyNumbers();
         
-        // Hapus data lama agar benar-benar tersinkronisasi
         await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
-        
-        // Proses ke Auto-Filter WA Engine
         await autoFilterAndSaveNumbers(chatId, myNumbers, msgId);
     }
     else if (action === 'cmd_search_range') {
@@ -398,15 +450,12 @@ bot.on('callback_query', async (query) => {
         const result = await acc.addNumber(termId);
         
         if (result && result.message) {
-            // Ambil nomor yang baru dibeli
             const existingNums = await dbAll('SELECT number FROM wa_numbers WHERE chat_id = ?', [chatId]);
             const existingSet = new Set(existingNums.map(n => n.number));
             const allMyNumbers = await acc.getMyNumbers();
             
-            // Filter nomor yang benar-benar baru
             const newNumbers = allMyNumbers.filter(n => !existingSet.has(n.number));
             
-            // Lemparkan ke Auto-Filter WA
             if (newNumbers.length > 0) {
                 await autoFilterAndSaveNumbers(chatId, newNumbers, msgId);
             } else {
@@ -458,7 +507,6 @@ bot.on('callback_query', async (query) => {
             
             await safeEditMessageText(reply + `⏳ _Memulai sinkronisasi dan filter WA untuk nomor baru..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
-            // Proses Sinkronisasi & Filter WA untuk nomor yang baru didapat
             const existingNums = await dbAll('SELECT number FROM wa_numbers WHERE chat_id = ?', [chatId]);
             const existingSet = new Set(existingNums.map(n => n.number));
             const allMyNumbers = await acc.getMyNumbers();
@@ -500,24 +548,33 @@ bot.on('callback_query', async (query) => {
     }
     else if (action === 'cmd_status') {
         const countRow = await dbGet('SELECT COUNT(*) as count FROM wa_numbers WHERE chat_id = ?', [chatId]);
-        const statusMsg = `🟢 *IVAS:* ${activeSessions.has(chatId) ? 'AKTIF' : 'OFFLINE'}\n🤖 *BOT WA:* ${sock?.authState?.creds?.registered ? 'TERHUBUNG' : 'DISCONNECTED'}\n🗃 *DB SQLite:* ${countRow.count} WA Aktif Tersimpan`;
+        const statusMsg = `🟢 *IVAS:* ${activeSessions.has(chatId) ? 'AKTIF' : 'OFFLINE'}\n🤖 *BOT WA:* ${sock?.authState?.creds?.registered ? 'TERHUBUNG' : 'DISCONNECTED'}\n🗃 *Database:* ${countRow.count} WA Aktif Tersimpan`;
         safeEditMessageText(statusMsg, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
     else if (action === 'cmd_logout') {
         await dbRun('DELETE FROM sessions WHERE chat_id = ?', [chatId]);
         await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
         activeSessions.delete(chatId);
-        safeEditMessageText("✅ IVAS Logout berhasil. Data dihapus dari SQLite.", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
+        safeEditMessageText("✅ IVAS Logout berhasil. Data dibersihkan dari sistem.", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
     }
     else if (action === 'cmd_cancel') {
         userStates[chatId].state = 'IDLE';
         safeEditMessageText("Operasi dibatalkan.\n\n*🤖 Panel Universal Pansa AI*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
     else if (action === 'cmd_wa_login') {
-        if (chatId !== ADMIN_CHAT_ID) return bot.sendMessage(chatId, "⛔ Akses Ditolak: Khusus Admin.");
         if (fs.existsSync('./auth_info_baileys/creds.json')) return bot.answerCallbackQuery(query.id, { text: 'WhatsApp sudah terhubung!', show_alert: true });
         userStates[chatId].state = 'WAITING_WA_PHONE';
         safeEditMessageText("📱 *Pairing WhatsApp*\nMasukkan nomor WA yang ada di HP Anda.\n_(Format: 628xxx tanpa spasi)_", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
+    }
+    else if (action.startsWith('start_')) {
+        if (!sock?.authState?.creds?.registered) return bot.answerCallbackQuery(query.id, { text: '⚠️ WhatsApp belum terhubung!', show_alert: true });
+        const [, jobId, mode] = action.split('_');
+        const numbersList = jobQueue.get(jobId);
+        if (!numbersList) return bot.answerCallbackQuery(query.id, { text: 'Sesi file/nomor kadaluarsa.', show_alert: true });
+
+        safeEditMessageText(`⏳ *Memulai Bulk Check WA...*\n⚙️ Mode: *${mode.toUpperCase()}*\n📊 Total: *${numbersList.length}* nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        processBulkCheck(numbersList, SPEED_MODES[mode], chatId, msgId);
+        jobQueue.delete(jobId);
     }
 });
 
@@ -527,35 +584,37 @@ bot.on('message', async (msg) => {
 
     if (!text || text.startsWith('/')) return;
     bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    
+    if (!isAdmin(chatId)) return;
 
     if (!userStates[chatId]) return;
     const { state: currentState, lastMsgId: menuMsgId } = userStates[chatId];
 
     if (currentState === 'WAITING_COOKIE') {
-        userStates[chatId].state = 'IDLE'; 
-        try {
-            let cookiesObj = {};
-            const cookiesRaw = JSON.parse(text);
-            if (Array.isArray(cookiesRaw)) cookiesRaw.forEach(c => { if (c.name && c.value) cookiesObj[c.name] = c.value; });
-            else cookiesObj = cookiesRaw;
-
-            if (!cookiesObj['ivas_sms_session']) throw new Error('Invalid');
+        const parts = text.split('=');
+        if (parts.length >= 2) {
+            const name = parts[0].trim();
+            const value = parts.slice(1).join('=').trim();
+            if (!userStates[chatId].tempCookies) userStates[chatId].tempCookies = {};
+            userStates[chatId].tempCookies[name] = value;
             
-            await dbRun('INSERT OR REPLACE INTO sessions (chat_id, cookies, last_total_sms) VALUES (?, ?, ?)', [chatId, JSON.stringify(cookiesObj), -1]);
-
-            await safeEditMessageText("⏳ Login IVAS...", { chat_id: chatId, message_id: menuMsgId });
-            const success = await startIvasSession(chatId);
-            
-            if (success) {
-                const acc = activeSessions.get(chatId);
-                const myNumbers = await acc.getMyNumbers();
-                
-                await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
-                await autoFilterAndSaveNumbers(chatId, myNumbers, menuMsgId);
-            } else {
-                safeEditMessageText("❌ *Login Gagal!*", { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-            }
-        } catch (e) { safeEditMessageText("❌ Format Cookie Salah!", { chat_id: chatId, message_id: menuMsgId, reply_markup: getMainMenuMarkup() }); }
+            const addedKeys = Object.keys(userStates[chatId].tempCookies).map(k => `\`${k}\``).join(', ');
+            const markup = {
+                inline_keyboard: [
+                    [{ text: '✅ Selesai & Login', callback_data: 'cmd_finish_login' }],
+                    [{ text: '❌ Batal', callback_data: 'cmd_cancel' }]
+                ]
+            };
+            safeEditMessageText(`🔑 *Update Cookie IVAS*\n✅ Tersimpan!\n\nCookie saat ini: ${addedKeys}\n\nKirim cookie lain dengan format \`nama=nilai\`, atau klik tombol *Selesai & Login*.`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: markup });
+        } else {
+            const markup = {
+                inline_keyboard: [
+                    [{ text: '✅ Selesai & Login', callback_data: 'cmd_finish_login' }],
+                    [{ text: '❌ Batal', callback_data: 'cmd_cancel' }]
+                ]
+            };
+            safeEditMessageText(`❌ Format salah!\nGunakan format \`nama=nilai\`\n\nContoh: \`ivas_sms_session=eyJp...\``, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: markup });
+        }
     } 
     else if (currentState === 'WAITING_RANGE') {
         userStates[chatId].state = 'IDLE';
@@ -592,7 +651,7 @@ bot.on('message', async (msg) => {
         try {
             let foundMsgs = null; let foundC = '';
             
-            // Cek di DB SQLite
+            // Cek di DB Internal
             const dbRegionRow = await dbGet('SELECT range_name FROM wa_numbers WHERE number = ? AND chat_id = ?', [targetNumber, chatId]);
 
             if (dbRegionRow) {
@@ -600,7 +659,7 @@ bot.on('message', async (msg) => {
                 foundMsgs = await acc.getMessages(targetNumber, dbRegionRow.range_name, todayStr);
                 foundC = dbRegionRow.range_name;
             } else {
-                await safeEditMessageText(`🔍 *Pencarian Global*\nNomor tidak ada di DB SQLite. Memindai seluruh region Ivasms...`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown' });
+                await safeEditMessageText(`🔍 *Pencarian Global*\nNomor tidak ada di DB lokal. Memindai seluruh region Ivasms...`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown' });
                 const checkData = await acc.getCountries(todayStr);
                 for (const c of checkData.countries) {
                     const numbersInCountry = await acc.getNumbers(c, todayStr);
@@ -633,7 +692,64 @@ bot.on('message', async (msg) => {
     }
 });
 
-// --- SMART POLLING SQLITE ---
+bot.on('document', async (msg) => {
+    const chatId = msg.chat.id.toString();
+    if (!isAdmin(chatId)) return;
+    
+    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+    
+    if (!sock?.authState?.creds?.registered) {
+        const sm = await bot.sendMessage(chatId, '⚠️ WhatsApp belum terhubung!', { reply_markup: getMainMenuMarkup() });
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+        return;
+    }
+    if (!msg.document.file_name.endsWith('.txt')) {
+        const sm = await bot.sendMessage(chatId, '❌ Hanya file .txt yang diizinkan.', { reply_markup: getMainMenuMarkup() });
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+        return;
+    }
+    
+    try {
+        const fileLink = await bot.getFileLink(msg.document.file_id);
+        const res = await axios.get(fileLink);
+        let rawNumbers = res.data.split('\n').map(n => n.replace(/\D/g, '')).filter(n => n.length > 8);
+        const uniqueNumbers = [...new Set(rawNumbers.map(n => n.startsWith('0') ? '62' + n.slice(1) : n))];
+        
+        if (uniqueNumbers.length === 0) {
+            const sm = await bot.sendMessage(chatId, '❌ Tidak ada nomor valid.', { reply_markup: getMainMenuMarkup() });
+            if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+            return;
+        }
+        
+        const jobId = Date.now().toString(); jobQueue.set(jobId, uniqueNumbers);
+        const sm = await bot.sendMessage(chatId, `📁 *Dokumen Diterima*\n*${uniqueNumbers.length}* nomor unik siap dieksekusi.\n\nPilih kecepatan:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [ [{ text: '🚀 Fast', callback_data: `start_${jobId}_fast` }, { text: '🚗 Normal', callback_data: `start_${jobId}_normal` }, { text: '🚲 Slow', callback_data: `start_${jobId}_slow` }] ] } });
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+    } catch (e) { 
+        const sm = await bot.sendMessage(chatId, `❌ Gagal baca file: ${e.message}`, { reply_markup: getMainMenuMarkup() }); 
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+    }
+});
+
+async function processBulkCheck(numbers, config, chatId, msgId) {
+    let resPersonal = "=== WA PERSONAL ===\n\n", resBisnis = "=== WA BISNIS ===\n\n", resUnreg = "=== UNREGISTERED ===\n\n";
+    let countP = 0, countB = 0, countU = 0, processed = 0, total = numbers.length;
+    for (let i = 0; i < total; i += config.batch) {
+        const batch = numbers.slice(i, i + config.batch);
+        const promises = batch.map(async (num, idx) => {
+            await delay(idx * 200); const jid = `${num}@s.whatsapp.net`; let result = { num, isReg: false, isBiz: false, bio: '-', desc: '-', cat: '-', dp: '-' };
+            try { const [status] = await sock.onWhatsApp(jid); if (status?.exists) { result.isReg = true; try { result.bio = (await sock.fetchStatus(jid))?.status || '-'; } catch(e){} try { result.dp = await sock.profilePictureUrl(jid, 'image') || '-'; } catch(e){} try { const biz = await sock.getBusinessProfile(jid); if (biz) { result.isBiz = true; result.desc = biz.description || '-'; result.cat = biz.category || '-'; } } catch(e){} } } catch(e) {} return result;
+        });
+        const batchRes = await Promise.allSettled(promises);
+        batchRes.forEach(r => { if (r.status === 'fulfilled') { const v = r.value; if (v.isReg) { if (v.isBiz) { resBisnis += `${v.num}\nBio: ${v.bio}\nCat: ${v.cat}\nDesc: ${v.desc}\nDP: ${v.dp}\n---\n`; countB++; } else { resPersonal += `${v.num}\nBio: ${v.bio}\nDP: ${v.dp}\n---\n`; countP++; } } else { resUnreg += `${v.num}\n`; countU++; } } });
+        processed += batch.length; safeEditMessageText(`⏳ *Proses Bulk Check...*\nProgress: ${processed} / ${total}\n_Jeda ${config.delay/1000}s..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }); if (processed < total) await delay(config.delay);
+    }
+    safeEditMessageText(`✅ *Bulk Check Selesai!*\nTotal: ${total}\n👤 Personal: *${countP}*\n🏢 Bisnis: *${countB}*\n❌ Unregistered: *${countU}*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+    if (countP > 0) bot.sendDocument(chatId, Buffer.from(resPersonal, 'utf-8'), {}, { filename: `Personal_${Date.now()}.txt`, contentType: 'text/plain' });
+    if (countB > 0) bot.sendDocument(chatId, Buffer.from(resBisnis, 'utf-8'), {}, { filename: `Bisnis_${Date.now()}.txt`, contentType: 'text/plain' });
+    if (countU > 0) bot.sendDocument(chatId, Buffer.from(resUnreg, 'utf-8'), {}, { filename: `Unregistered_${Date.now()}.txt`, contentType: 'text/plain' });
+}
+
+// --- SMART POLLING ---
 async function pollAllAccounts() {
     const today = getTodayUTC();
     const sessions = await dbAll('SELECT * FROM sessions');
@@ -657,7 +773,6 @@ async function pollAllAccounts() {
                     for (const msg of messages) {
                         const msgId = `${msg.phoneNumber}_${msg.time}_${msg.sender}`;
                         
-                        // Cek apakah pesan sudah dilihat di DB
                         const isSeen = await dbGet('SELECT msg_id FROM seen_ids WHERE msg_id = ? AND chat_id = ?', [msgId, chatId]);
                         
                         if (!isSeen) {
@@ -674,7 +789,6 @@ async function pollAllAccounts() {
             
             if (hasNew) { 
                 await dbRun('UPDATE sessions SET last_total_sms = ? WHERE chat_id = ?', [currentTotalSms, chatId]);
-                // Bersihkan histori seen_ids yang sudah terlalu lama agar DB tidak bengkak
                 await dbRun(`DELETE FROM seen_ids WHERE rowid NOT IN (SELECT rowid FROM seen_ids WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1000)`, [chatId]);
             }
         } catch (e) {
