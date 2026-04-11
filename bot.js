@@ -294,7 +294,6 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     });
 }
 
-// [UPDATE] Filter WA Bisnis saja + batch 100 nomor
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) {
         await safeEditMessageText(`✅ *Aksi Berhasil*\nSistem telah disinkronkan, namun tidak ada nomor di akun ini.`, {
@@ -304,7 +303,7 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     }
 
     if (!sock?.authState?.creds?.registered) {
-        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter status WhatsApp...`, {
+        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter...`, {
             chat_id: chatId, message_id: msgId, parse_mode: 'Markdown'
         });
         for (const n of numbersObjArray) {
@@ -331,13 +330,12 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
         const batch = numbersObjArray.slice(i, i + BATCH_SIZE);
 
         const results = await Promise.allSettled(batch.map(async (n, idx) => {
-            await delay(idx * 150); // stagger ringan agar tidak flood WA
+            await delay(idx * 150);
             const jid = `${n.number}@s.whatsapp.net`;
             try {
                 const [status] = await sock.onWhatsApp(jid);
                 if (!status?.exists) return null;
-
-                await delay(300); // jeda sebelum cek bisnis
+                await delay(300);
                 const bizProfile = await sock.getBusinessProfile(jid).catch(() => null);
                 if (bizProfile && Object.keys(bizProfile).length > 0) {
                     return { number: n.number, range: n.range };
@@ -357,19 +355,26 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
         }
 
         processed += batch.length;
-        safeEditMessageText(
-            `⏳ *Filter WA Bisnis...*\nProgress: ${processed} / ${total}\n🏢 Bisnis Tersimpan: *${bizCount}*`,
-            { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
-        ).catch(() => {});
 
-        if (i + BATCH_SIZE < total) await delay(1500); // jeda antar batch
+        // Jangan edit pesan di iterasi terakhir — biarkan pesan final yang handle
+        if (processed < total) {
+            await safeEditMessageText(
+                `⏳ *Filter WA Bisnis...*\nProgress: ${processed} / ${total}\n🏢 Bisnis Tersimpan: *${bizCount}*`,
+                { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
+            ).catch(() => {});
+            await delay(1500);
+        }
     }
+
+    // Tambah delay kecil sebelum edit final agar Telegram tidak reject karena terlalu cepat
+    await delay(500);
 
     await safeEditMessageText(
         `✅ *Filter WA Bisnis Selesai!*\nTotal Dicek: ${total}\n🏢 WA Bisnis Disimpan: *${bizCount}* Nomor`,
         { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }
     );
 }
+
 
 (async () => {
     console.log('[SYSTEM] Menyiapkan Database & Ivasms Sessions...');
