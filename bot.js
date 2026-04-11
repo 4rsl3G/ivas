@@ -14,9 +14,10 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TelegramBot(token, { 
     polling: true,
     request: {
-        family: 4
+        family: 4 // Memaksa bot menggunakan IPv4
     }
 });
+const POLLING_INTERVAL = process.env.POLLING_INTERVAL;
 const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL_ID ? process.env.BROADCAST_CHANNEL_ID.trim() : null;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? process.env.ADMIN_CHAT_ID.trim() : null; 
 
@@ -40,7 +41,7 @@ sqlDb.serialize(() => {
     dbRun(`CREATE TABLE IF NOT EXISTS wa_numbers (number TEXT PRIMARY KEY, chat_id TEXT, range_name TEXT)`);
 });
 
-const userStates = {}; 
+const userStates = {};
 const jobQueue = new Map();
 
 const SPEED_MODES = {
@@ -244,7 +245,7 @@ async function startIvasSession(chatId) {
 
 // ==========================================
 // MODUL 2: WHATSAPP BAILEYS & AUTO-FILTER DB
-// [UPDATE] Filter hanya WA Bisnis, batch 100 nomor
+// [UPDATE] Filter WA Bisnis saja, batch 100 nomor
 // ==========================================
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 let sock; let isConnectingWA = false; 
@@ -294,6 +295,7 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     });
 }
 
+// [UPDATE] Filter WA Bisnis saja + batch 100 nomor, fix stuck di progress akhir
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) {
         await safeEditMessageText(`✅ *Aksi Berhasil*\nSistem telah disinkronkan, namun tidak ada nomor di akun ini.`, {
@@ -303,13 +305,13 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     }
 
     if (!sock?.authState?.creds?.registered) {
-        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter...`, {
+        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter status WhatsApp...`, {
             chat_id: chatId, message_id: msgId, parse_mode: 'Markdown'
         });
         for (const n of numbersObjArray) {
             await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
         }
-        await delay(1000);
+        await delay(2000);
         await safeEditMessageText(`✅ *Selesai!* ${numbersObjArray.length} nomor tersimpan.`, {
             chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup()
         });
@@ -330,12 +332,12 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
         const batch = numbersObjArray.slice(i, i + BATCH_SIZE);
 
         const results = await Promise.allSettled(batch.map(async (n, idx) => {
-            await delay(idx * 150);
+            await delay(idx * 150); // stagger ringan agar tidak flood
             const jid = `${n.number}@s.whatsapp.net`;
             try {
                 const [status] = await sock.onWhatsApp(jid);
                 if (!status?.exists) return null;
-                await delay(300);
+                await delay(300); // jeda sebelum cek profil bisnis
                 const bizProfile = await sock.getBusinessProfile(jid).catch(() => null);
                 if (bizProfile && Object.keys(bizProfile).length > 0) {
                     return { number: n.number, range: n.range };
@@ -356,17 +358,18 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
 
         processed += batch.length;
 
-        // Jangan edit pesan di iterasi terakhir — biarkan pesan final yang handle
+        // Hanya update progress jika BUKAN batch terakhir
+        // agar tidak tabrakan dengan pesan final
         if (processed < total) {
             await safeEditMessageText(
                 `⏳ *Filter WA Bisnis...*\nProgress: ${processed} / ${total}\n🏢 Bisnis Tersimpan: *${bizCount}*`,
                 { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
             ).catch(() => {});
-            await delay(1500);
+            await delay(1500); // jeda antar batch
         }
     }
 
-    // Tambah delay kecil sebelum edit final agar Telegram tidak reject karena terlalu cepat
+    // Delay kecil agar Telegram tidak throttle edit berturutan
     await delay(500);
 
     await safeEditMessageText(
@@ -374,7 +377,6 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
         { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }
     );
 }
-
 
 (async () => {
     console.log('[SYSTEM] Menyiapkan Database & Ivasms Sessions...');
@@ -693,13 +695,11 @@ bot.on('callback_query', async (query) => {
     }
     else if (action.startsWith('start_')) {
         if (!sock?.authState?.creds?.registered) return bot.answerCallbackQuery(query.id, { text: '⚠️ WhatsApp belum terhubung!', show_alert: true });
-        const parts = action.split('_');
-        const mode = parts[parts.length - 1];
-        const jobId = parts.slice(1, parts.length - 1).join('_');
+        const [, jobId, mode] = action.split('_');
         const numbersList = jobQueue.get(jobId);
         if (!numbersList) return bot.answerCallbackQuery(query.id, { text: 'Sesi file/nomor kadaluarsa.', show_alert: true });
 
-        safeEditMessageText(`⏳ *Memulai Bulk Check WA Bisnis...*\n⚙️ Mode: *${mode.toUpperCase()}*\n📊 Total: *${numbersList.length}* nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        safeEditMessageText(`⏳ *Memulai Bulk Check WA...*\n⚙️ Mode: *${mode.toUpperCase()}*\n📊 Total: *${numbersList.length}* nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
         processBulkCheck(numbersList, SPEED_MODES[mode], chatId, msgId);
         jobQueue.delete(jobId);
     }
@@ -778,7 +778,7 @@ bot.on('message', async (msg) => {
         try {
             let foundMsgs = null; let foundC = '';
             
-            // Cek di DB Internal dulu (fast path)
+            // Cek di DB Internal
             const dbRegionRow = await dbGet('SELECT range_name FROM wa_numbers WHERE number = ? AND chat_id = ?', [targetNumber, chatId]);
 
             if (dbRegionRow) {
@@ -811,6 +811,7 @@ bot.on('message', async (msg) => {
     else if (currentState === 'WAITING_WA_PHONE') {
         userStates[chatId].state = 'IDLE';
         const phoneNumber = text.replace(/\D/g, '');
+        // Validasi nomor global (bebas asal minimal 8 digit)
         if (phoneNumber.length < 8) {
             return safeEditMessageText("❌ Format WA salah! Masukkan nomor lengkap beserta kode negaranya (contoh: 628xxx, 447xxx, 123xxx).", { chat_id: chatId, message_id: menuMsgId, reply_markup: getMainMenuMarkup() });
         }
@@ -848,9 +849,8 @@ bot.on('document', async (msg) => {
             return;
         }
         
-        const jobId = Date.now().toString();
-        jobQueue.set(jobId, uniqueNumbers);
-        const sm = await bot.sendMessage(chatId, `📁 *Dokumen Diterima*\n*${uniqueNumbers.length}* nomor unik siap dicek WA Bisnis.\n\nPilih kecepatan:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [ [{ text: '🚀 Fast', callback_data: `start_${jobId}_fast` }, { text: '🚗 Normal', callback_data: `start_${jobId}_normal` }, { text: '🚲 Slow', callback_data: `start_${jobId}_slow` }] ] } });
+        const jobId = Date.now().toString(); jobQueue.set(jobId, uniqueNumbers);
+        const sm = await bot.sendMessage(chatId, `📁 *Dokumen Diterima*\n*${uniqueNumbers.length}* nomor unik siap dieksekusi.\n\nPilih kecepatan:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [ [{ text: '🚀 Fast', callback_data: `start_${jobId}_fast` }, { text: '🚗 Normal', callback_data: `start_${jobId}_normal` }, { text: '🚲 Slow', callback_data: `start_${jobId}_slow` }] ] } });
         if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
     } catch (e) { 
         const sm = await bot.sendMessage(chatId, `❌ Gagal baca file: ${e.message}`, { reply_markup: getMainMenuMarkup() }); 
@@ -858,71 +858,28 @@ bot.on('document', async (msg) => {
     }
 });
 
-// [UPDATE] processBulkCheck — hanya simpan WA Bisnis ke hasil
 async function processBulkCheck(numbers, config, chatId, msgId) {
-    let resBisnis = "=== WA BISNIS ===\n\n";
-    let resUnreg = "=== UNREGISTERED / PERSONAL ===\n\n";
-    let countB = 0, countU = 0, processed = 0, total = numbers.length;
-
+    let resPersonal = "=== WA PERSONAL ===\n\n", resBisnis = "=== WA BISNIS ===\n\n", resUnreg = "=== UNREGISTERED ===\n\n";
+    let countP = 0, countB = 0, countU = 0, processed = 0, total = numbers.length;
     for (let i = 0; i < total; i += config.batch) {
         const batch = numbers.slice(i, i + config.batch);
         const promises = batch.map(async (num, idx) => {
-            await delay(idx * 200);
-            const jid = `${num}@s.whatsapp.net`;
-            let result = { num, isReg: false, isBiz: false, bio: '-', desc: '-', cat: '-', dp: '-' };
-            try {
-                const [status] = await sock.onWhatsApp(jid);
-                if (status?.exists) {
-                    result.isReg = true;
-                    try { result.bio = (await sock.fetchStatus(jid))?.status || '-'; } catch(e){}
-                    try { result.dp = await sock.profilePictureUrl(jid, 'image') || '-'; } catch(e){}
-                    await delay(300);
-                    try {
-                        const biz = await sock.getBusinessProfile(jid);
-                        if (biz && Object.keys(biz).length > 0) {
-                            result.isBiz = true;
-                            result.desc = biz.description || '-';
-                            result.cat = biz.category || '-';
-                        }
-                    } catch(e){}
-                }
-            } catch(e) {}
-            return result;
+            await delay(idx * 200); const jid = `${num}@s.whatsapp.net`; let result = { num, isReg: false, isBiz: false, bio: '-', desc: '-', cat: '-', dp: '-' };
+            try { const [status] = await sock.onWhatsApp(jid); if (status?.exists) { result.isReg = true; try { result.bio = (await sock.fetchStatus(jid))?.status || '-'; } catch(e){} try { result.dp = await sock.profilePictureUrl(jid, 'image') || '-'; } catch(e){} try { const biz = await sock.getBusinessProfile(jid); if (biz) { result.isBiz = true; result.desc = biz.description || '-'; result.cat = biz.category || '-'; } } catch(e){} } } catch(e) {} return result;
         });
-
         const batchRes = await Promise.allSettled(promises);
-        batchRes.forEach(r => {
-            if (r.status === 'fulfilled') {
-                const v = r.value;
-                if (v.isBiz) {
-                    resBisnis += `${v.num}\nBio: ${v.bio}\nCat: ${v.cat}\nDesc: ${v.desc}\nDP: ${v.dp}\n---\n`;
-                    countB++;
-                } else {
-                    resUnreg += `${v.num}\n`;
-                    countU++;
-                }
-            }
-        });
-
-        processed += batch.length;
-        safeEditMessageText(
-            `⏳ *Proses Bulk Check WA Bisnis...*\nProgress: ${processed} / ${total}\n🏢 Bisnis: *${countB}* | ❌ Non-Bisnis: *${countU}*\n_Jeda ${config.delay/1000}s..._`,
-            { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
-        );
-        if (processed < total) await delay(config.delay);
+        batchRes.forEach(r => { if (r.status === 'fulfilled') { const v = r.value; if (v.isReg) { if (v.isBiz) { resBisnis += `${v.num}\nBio: ${v.bio}\nCat: ${v.cat}\nDesc: ${v.desc}\nDP: ${v.dp}\n---\n`; countB++; } else { resPersonal += `${v.num}\nBio: ${v.bio}\nDP: ${v.dp}\n---\n`; countP++; } } else { resUnreg += `${v.num}\n`; countU++; } } });
+        processed += batch.length; safeEditMessageText(`⏳ *Proses Bulk Check...*\nProgress: ${processed} / ${total}\n_Jeda ${config.delay/1000}s..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }); if (processed < total) await delay(config.delay);
     }
-
-    safeEditMessageText(
-        `✅ *Bulk Check Selesai!*\nTotal: ${total}\n🏢 WA Bisnis: *${countB}*\n❌ Non-Bisnis/Unregistered: *${countU}*`,
-        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }
-    );
-    if (countB > 0) bot.sendDocument(chatId, Buffer.from(resBisnis, 'utf-8'), {}, { filename: `WA_Bisnis_${Date.now()}.txt`, contentType: 'text/plain' });
-    if (countU > 0) bot.sendDocument(chatId, Buffer.from(resUnreg, 'utf-8'), {}, { filename: `Non_Bisnis_${Date.now()}.txt`, contentType: 'text/plain' });
+    safeEditMessageText(`✅ *Bulk Check Selesai!*\nTotal: ${total}\n👤 Personal: *${countP}*\n🏢 Bisnis: *${countB}*\n❌ Unregistered: *${countU}*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+    if (countP > 0) bot.sendDocument(chatId, Buffer.from(resPersonal, 'utf-8'), {}, { filename: `Personal_${Date.now()}.txt`, contentType: 'text/plain' });
+    if (countB > 0) bot.sendDocument(chatId, Buffer.from(resBisnis, 'utf-8'), {}, { filename: `Bisnis_${Date.now()}.txt`, contentType: 'text/plain' });
+    if (countU > 0) bot.sendDocument(chatId, Buffer.from(resUnreg, 'utf-8'), {}, { filename: `Unregistered_${Date.now()}.txt`, contentType: 'text/plain' });
 }
 
 // ==========================================
-// MODUL 4: SMART POLLING — HANYA NOMOR DI DB
-// [UPDATE] Polling 10 detik, hanya nomor tersimpan
+// MODUL 4: SMART POLLING
+// [UPDATE] Hanya polling nomor di DB, interval 10 detik
 // ==========================================
 async function pollAllAccounts() {
     const today = getTodayUTC();
@@ -934,13 +891,15 @@ async function pollAllAccounts() {
         if (!account || !account.loggedIn) continue;
 
         try {
-            // [UPDATE] Ambil hanya nomor yang tersimpan di DB
+            // [UPDATE] Ambil hanya nomor yang tersimpan di DB, tidak scan seluruh region
             const savedNumbers = await dbAll(
                 'SELECT number, range_name FROM wa_numbers WHERE chat_id = ?',
                 [chatId]
             );
 
             if (savedNumbers.length === 0) continue;
+
+            let hasNew = false;
 
             for (const row of savedNumbers) {
                 const messages = await account.getMessages(row.number, row.range_name, today);
@@ -957,7 +916,7 @@ async function pollAllAccounts() {
                             'INSERT INTO seen_ids (msg_id, chat_id) VALUES (?, ?)',
                             [msgId, chatId]
                         );
-
+                        hasNew = true;
                         if (BROADCAST_CHANNEL) {
                             const card = formatMessageCard(msg, false);
                             bot.sendMessage(BROADCAST_CHANNEL, card.text, {
@@ -969,13 +928,15 @@ async function pollAllAccounts() {
                 }
             }
 
-            // Bersihkan seen_ids lama, simpan 1000 terakhir per user
-            await dbRun(
-                `DELETE FROM seen_ids WHERE chat_id = ? AND rowid NOT IN (
-                    SELECT rowid FROM seen_ids WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1000
-                )`,
-                [chatId, chatId]
-            );
+            if (hasNew) {
+                // Bersihkan seen_ids lama, simpan 1000 terakhir per user
+                await dbRun(
+                    `DELETE FROM seen_ids WHERE rowid NOT IN (
+                        SELECT rowid FROM seen_ids WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1000
+                    )`,
+                    [chatId]
+                );
+            }
 
         } catch (e) {
             if (e.response && (e.response.status === 401 || e.response.status === 403)) {
@@ -985,6 +946,6 @@ async function pollAllAccounts() {
         }
     }
 
-    // [UPDATE] Interval polling 10 detik
+    // [UPDATE] Hardcode 10 detik, tidak pakai env POLLING_INTERVAL
     setTimeout(pollAllAccounts, 10000);
 }
