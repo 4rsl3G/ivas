@@ -377,22 +377,32 @@ bot.onText(/\/returnnumbers/, async (msg) => {
   await sendMsg(msg.chat.id, `✅ ${escMd(res.message || 'Berhasil')}`);
 });
 
-// ─── PERBAIKAN COMMAND /setcookie ─────────────────────────────────────────────
-bot.onText(/\/setcookie ([\s\S]+)/, async (msg, match) => {
+// ─── PERBAIKAN COMMAND /setcookie (VERSI ULTIMATE) ─────────────────────────
+bot.onText(/\/setcookie([\s\S]+)/, async (msg, match) => {
   try {
-    // Ubah baris baru (enter) menjadi titik koma (;) agar tetap bisa di-split dengan benar
-    const cookieStr = match[1].replace(/\n/g, '; ').trim();
-    const cookieObj = {};
+    const rawInput = match[1].trim();
     
-    cookieStr.split(';').forEach(p => {
-      const [k, ...v] = p.trim().split('=');
-      if (k) cookieObj[k.trim()] = v.join('=').trim();
-    });
+    // Gunakan Regex (Scanner) untuk memburu token langsung tanpa memedulikan enter/spasi
+    const xsrfMatch = rawInput.match(/XSRF-TOKEN=([^;\s]+)/i);
+    const sessionMatch = rawInput.match(/ivas_sms_session=([^;\s]+)/i);
+
+    // Cek apakah kedua token berhasil ditemukan di dalam teks
+    if (!xsrfMatch || !sessionMatch) {
+      return await sendMsg(msg.chat.id, '❌ *Gagal:* Tidak menemukan `XSRF-TOKEN` atau `ivas_sms_session` di dalam teks\\! Pastikan keduanya tercopy dengan lengkap\\.');
+    }
+
+    // Masukkan hasil ekstraksi ke dalam object
+    const cookieObj = {
+      'XSRF-TOKEN': xsrfMatch[1],
+      'ivas_sms_session': sessionMatch[1]
+    };
     
-    saveCookie(cookieObj, cookieStr);
-    await sendMsg(msg.chat.id, '✅ Cookie berhasil disimpan\\!');
+    // Simpan ke cookies.json
+    saveCookie(cookieObj, rawInput);
+    
+    await sendMsg(msg.chat.id, '✅ *Sempurna\\! Cookie berhasil diekstrak dan disimpan\\.* Coba jalankan flow sekarang\\.');
   } catch (e) {
-    await sendMsg(msg.chat.id, `❌ Format salah: ${escMd(e.message)}`);
+    await sendMsg(msg.chat.id, `❌ *Format salah:* ${escMd(e.message)}`);
   }
 });
 
