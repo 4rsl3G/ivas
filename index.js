@@ -17,7 +17,7 @@ const bot = new TelegramBot(token, {
         family: 4 // Memaksa bot menggunakan IPv4
     }
 });
-const POLLING_INTERVAL = process.env.POLLING_INTERVAL || 20000;
+const POLLING_INTERVAL = process.env.POLLING_INTERVAL;
 const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL_ID ? process.env.BROADCAST_CHANNEL_ID.trim() : null;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? process.env.ADMIN_CHAT_ID.trim() : null; 
 
@@ -359,7 +359,7 @@ const getCancelMarkup = () => ({ inline_keyboard: [[{ text: '❌ Batal', callbac
 function formatMessageCard(msgData, isManual = false) {
     const otpMatch = msgData.text.match(/\b\d{3}[-\s]?\d{3}\b/);
     const cleanOtp = otpMatch ? otpMatch[0].replace(/\D/g, '') : null;
-    const text = `🌐 *PANSA STUDIO | OTP CHECKER*\n━━━━━━━━━━━━━━━━━━\n📱 *Nomor:* \`${msgData.phoneNumber}\`\n🌍 *Region:* ${msgData.countryRange}\n📨 *Sender:* ${msgData.sender}\n⏱ *Time:* ${msgData.time} (UTC)\n━━━━━━━━━━━━━━━━━━\n💬 *Pesan:*\n_${msgData.text}_\n━━━━━━━━━━━━━━━━━━` + (cleanOtp ? `\n\n💡 _Tap angka di bawah ini untuk copy:_ \n👉 \`${cleanOtp}\` 👈` : '');
+    const text = `🌐 *PANSA GROUP | OTP MASUK*\n━━━━━━━━━━━━━━━━━━\n📱 *Nomor:* \`${msgData.phoneNumber}\`\n🌍 *Region:* ${msgData.countryRange}\n📨 *Sender:* ${msgData.sender}\n⏱ *Time:* ${msgData.time} (UTC)\n━━━━━━━━━━━━━━━━━━\n💬 *Pesan:*\n_${msgData.text}_\n━━━━━━━━━━━━━━━━━━` + (cleanOtp ? `\n\n💡 _Tap angka di bawah ini untuk copy:_ \n👉 \`${cleanOtp}\` 👈` : '');
     const inline_keyboard = [];
     if (cleanOtp) inline_keyboard.push([{ text: `📋 OTP: ${cleanOtp}`, callback_data: 'dummy_btn' }]);
     inline_keyboard.push([{ text: '🤖 Kembali ke Panel', url: `https://t.me/${process.env.BOT_USERNAME || 'bot'}` }]); 
@@ -530,12 +530,12 @@ bot.on('callback_query', async (query) => {
     else if (action === 'cmd_hunt_wa') {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ Kamu belum login IVAS!", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
         const acc = activeSessions.get(chatId);
-        const MAX_BUY = 3; 
+        const MAX_BUY = 5; 
         await safeEditMessageText(`🎯 *AUTO-SNIPER WA AKTIF*\nBot akan memonitor Live Feed, mencari Range WA yang gacor, dan *otomatis menambahkan* 1 Range dari setiap temuan.\n\n_Maksimal target: ${MAX_BUY} Range. Harap tunggu..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
         const uniqueRanges = new Set();
         const purchasedRanges = [];
-        const maxRetries = 15; 
+        const maxRetries = 100; 
 
         for (let i = 1; i <= maxRetries; i++) {
             const data = await acc.fetchLiveTestSMS();
