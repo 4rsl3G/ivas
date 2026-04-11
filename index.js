@@ -21,11 +21,11 @@ const {
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const config = require('./config.json');
-// Mengaktifkan bot
 const bot = new TelegramBot(config.telegram_token, { polling: true });
 
-// ─── STATE ────────────────────────────────────────────────────────────────────
+// ─── STATE MANAGEMENT ─────────────────────────────────────────────────────────
 let isRunning = false;
+const userStates = {}; // Menyimpan status input user untuk wizard cookie
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function log(msg) {
@@ -33,21 +33,22 @@ function log(msg) {
   console.log(`[${ts}] ${msg}`);
 }
 
-function escMd(text) {
-  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+// Aman dari karakter aneh karena pakai HTML
+function esc(text) {
+  if (!text) return '-';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 async function sendMsg(chatId, text, options = {}) {
   try {
-    bot.sendChatAction(chatId, 'typing'); // Indikator bot sedang mengetik
-    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...options });
+    bot.sendChatAction(chatId, 'typing');
+    // Berubah jadi HTML agar teks lebih rapi dan bersih
+    await bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...options });
   } catch (e) {
-    try {
-      // Fallback jika Markdown gagal diparse
-      await bot.sendMessage(chatId, text.replace(/[*_`\\[\]]/g, ''), options);
-    } catch (e2) {
-      console.error('Send error:', e2.message);
-    }
+    console.error('Send error:', e.message);
   }
 }
 
@@ -64,42 +65,37 @@ function extractIdFromAction(actionHtml) {
   return match ? match[1] : null;
 }
 
+// Membersihkan token dari spasi, enter, atau atribut tambahan
+function cleanToken(text) {
+  let cleaned = text;
+  if (cleaned.includes('=')) {
+    const parts = cleaned.split(';');
+    cleaned = parts[0]; 
+    if (cleaned.includes('XSRF-TOKEN=')) cleaned = cleaned.replace(/.*?XSRF-TOKEN=/i, '');
+    if (cleaned.includes('ivas_sms_session=')) cleaned = cleaned.replace(/.*?ivas_sms_session=/i, '');
+  }
+  return cleaned.replace(/[\r\n\s]+/g, ''); // Hapus semua enter & spasi
+}
+
 // ─── AMBIL MY NUMBERS ────────────────────────────────────────────────────────
 async function getAssignedNumbers(cookie, rangeName) {
   try {
-    const ts = Date.now();
     const params = new URLSearchParams({
-      draw: '1',
-      'columns[1][data]': 'Number',
-      'columns[1][name]': 'Number',
-      'columns[2][data]': 'range',
-      'columns[2][name]': 'range',
-      'columns[7][data]': 'action',
-      'order[0][column]': '1',
-      'order[0][dir]': 'desc',
-      'start': '0',
-      'length': '100',
-      'search[value]': rangeName || '',
-      '_': String(ts)
+      draw: '1', 'columns[1][data]': 'Number', 'columns[2][data]': 'range',
+      'columns[7][data]': 'action', 'order[0][column]': '1', 'order[0][dir]': 'desc',
+      'start': '0', 'length': '100', 'search[value]': rangeName || '', '_': String(Date.now())
     });
 
-    const res = await axios.get(
-      `https://www.ivasms.com/portal/numbers?${params.toString()}`,
-      {
-        headers: {
-          'Cookie': buildCookieHeader(cookie),
-          'X-CSRF-TOKEN': getCsrfToken(cookie),
-          'X-Requested-With': 'XMLHttpRequest',
-          'Accept': 'application/json, text/javascript, */*; q=0.01',
-          'Referer': 'https://www.ivasms.com/portal/numbers',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        timeout: 15000
-      }
-    );
-
-    const rows = res.data?.data || [];
-    return { expired: false, data: rows };
+    const res = await axios.get(`https://www.ivasms.com/portal/numbers?${params.toString()}`, {
+      headers: {
+        'Cookie': buildCookieHeader(cookie), 'X-CSRF-TOKEN': getCsrfToken(cookie),
+        'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Referer': 'https://www.ivasms.com/portal/numbers',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      timeout: 15000
+    });
+    return { expired: false, data: res.data?.data || [] };
   } catch (err) {
     if (err.response?.status === 401 || err.response?.status === 419) return { expired: true };
     return { expired: false, data: [], error: err.message };
@@ -108,15 +104,11 @@ async function getAssignedNumbers(cookie, rangeName) {
 
 // ─── FORMAT STATS ─────────────────────────────────────────────────────────────
 async function formatAndSendStats(chatId, stats, date) {
-  if (!stats || stats.length === 0) {
-    return sendMsg(chatId, '📊 Tidak ada data SMS Statistics untuk hari ini\\.');
-  }
-  if (stats[0]?.parse_failed) {
-    return sendMsg(chatId, '⚠️ SMS Statistics tersedia tapi gagal di\\-parse\\. Cek manual di portal\\.');
-  }
+  if (!stats || stats.length === 0) return sendMsg(chatId, '📊 Tidak ada data SMS Statistics untuk hari ini.');
+  if (stats[0]?.parse_failed) return sendMsg(chatId, '⚠️ SMS Statistics tersedia tapi gagal di-parse. Cek manual di portal.');
 
   let totalSMS = 0, totalPaid = 0, totalUnpaid = 0, totalRevenue = 0;
-  let msg = `📊 *SMS Statistics — ${escMd(date)}*\n${'─'.repeat(28)}\n\n`;
+  let msg = `📊 <b>SMS Statistics — ${esc(date)}</b>\n${'─'.repeat(28)}\n\n`;
 
   for (const r of stats) {
     totalSMS     += parseInt(r.count || 0);
@@ -124,369 +116,232 @@ async function formatAndSendStats(chatId, stats, date) {
     totalUnpaid  += parseInt(r.unpaid || 0);
     totalRevenue += parseFloat(r.revenue || 0);
 
-    msg += `📁 *${escMd(r.range_name || '-')}*\n`;
+    msg += `📁 <b>${esc(r.range_name || '-')}</b>\n`;
     msg += `  SMS: ${r.count||0} | ✅ ${r.paid||0} | ❌ ${r.unpaid||0}\n`;
-    msg += `  💰 \\$${parseFloat(r.revenue||0).toFixed(4)}\n\n`;
+    msg += `  💰 $${parseFloat(r.revenue||0).toFixed(4)}\n\n`;
   }
 
-  msg += `${'─'.repeat(28)}\n📈 *TOTAL*\n`;
+  msg += `${'─'.repeat(28)}\n📈 <b>TOTAL</b>\n`;
   msg += `• SMS: ${totalSMS} | ✅ ${totalPaid} | ❌ ${totalUnpaid}\n`;
-  msg += `• 💰 \\$${totalRevenue.toFixed(4)}`;
+  msg += `• 💰 $${totalRevenue.toFixed(4)}`;
 
-  if (msg.length > 4000) {
-    const chunks = msg.match(/.{1,4000}/gs) || [];
-    for (const chunk of chunks) { await sendMsg(chatId, chunk); await sleep(300); }
-  } else {
-    await sendMsg(chatId, msg);
-  }
+  await sendMsg(chatId, msg);
 }
 
-// ─── KEYBOARD MENU (CANGGIH) ──────────────────────────────────────────────────
+// ─── KEYBOARDS (FULL MENU) ────────────────────────────────────────────────────
 const mainKeyboard = {
   reply_markup: {
     inline_keyboard: [
-      [
-        { text: '🚀 Jalankan Flow', callback_data: 'run_flow' },
-        { text: '📊 Cek Statistik', callback_data: 'check_stats' }
-      ],
-      [
-        { text: '📱 Cek SID WhatsApp', callback_data: 'check_sid' },
-        { text: '📡 Status Monitor', callback_data: 'check_monitor' }
-      ],
-      [
-        { text: '⏹ Stop Monitor', callback_data: 'stop_monitor' },
-        { text: '♻️ Return Numbers', callback_data: 'return_nums' }
-      ],
-      [
-        { text: '📖 Bantuan / Help', callback_data: 'help_menu' }
-      ]
+      [{ text: '🚀 Jalankan Flow Utama', callback_data: 'run_flow' }],
+      [{ text: '📊 Statistik', callback_data: 'check_stats' }, { text: '📱 Cek SID WA', callback_data: 'check_sid' }],
+      [{ text: '📡 Status Monitor', callback_data: 'check_monitor' }, { text: '⏹ Stop Monitor', callback_data: 'stop_monitor' }],
+      [{ text: '♻️ Return Semua', callback_data: 'return_nums' }, { text: '📋 My Numbers', callback_data: 'my_numbers' }],
+      [{ text: '🍪 Update Cookie (Login)', callback_data: 'update_cookie' }]
     ]
+  }
+};
+
+const cancelKeyboard = {
+  reply_markup: {
+    inline_keyboard: [[{ text: '❌ Batal / Cancel', callback_data: 'cancel_input' }]]
   }
 };
 
 // ─── FLOW UTAMA ───────────────────────────────────────────────────────────────
 async function runFullFlow(chatId) {
-  if (isRunning) {
-    return sendMsg(chatId, '⚠️ Flow sedang berjalan, tunggu selesai dulu\\.');
-  }
+  if (isRunning) return sendMsg(chatId, '⚠️ Flow sedang berjalan, tunggu selesai dulu.');
   isRunning = true;
   const today = new Date().toISOString().split('T')[0];
 
   try {
-    await sendMsg(chatId, '🚀 *Memulai flow iVAS\\.\\.\\.*');
+    await sendMsg(chatId, '🚀 <b>Memulai flow iVAS...</b>');
 
     const cookie = loadCookie();
     if (!cookie) {
       isRunning = false;
-      return sendMsg(chatId, '❌ Cookie tidak ditemukan\\. Update dengan /setcookie');
+      return sendMsg(chatId, '❌ Cookie tidak ditemukan. Silakan klik tombol <b>Update Cookie</b> di menu.');
     }
 
-    // Stop monitor & clear
     if (getMonitorStatus().isRunning) {
       stopMonitoring();
-      await sendMsg(chatId, '⏹ Monitor lama dihentikan\\.');
+      await sendMsg(chatId, '⏹ Monitor lama dihentikan.');
     }
     clearNumbers();
 
-    // [1/5] Return all numbers
-    await sendMsg(chatId, '♻️ *\\[1/5\\]* Return semua number\\.\\.\\.');
+    await sendMsg(chatId, '♻️ <b>[1/5]</b> Return semua number...');
     const ret = await returnAllNumbers(cookie);
-    if (ret.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie'); }
-    await sendMsg(chatId, `✅ ${escMd(ret.message || 'Berhasil')}`);
+    if (ret.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired! Silakan Update Cookie.'); }
+    await sendMsg(chatId, `✅ ${esc(ret.message || 'Berhasil')}`);
     await sleep(3000);
 
-    // [2/5] Ambil SID WhatsApp
-    await sendMsg(chatId, '🔍 *\\[2/5\\]* Mencari SID WhatsApp terbaru\\.\\.\\.');
+    await sendMsg(chatId, '🔍 <b>[2/5]</b> Mencari SID WhatsApp terbaru...');
     const sids = await getLatestWhatsappSID(cookie);
-    if (sids.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie'); }
-    if (!sids.data?.length) { isRunning = false; return sendMsg(chatId, '⚠️ Tidak ada SID WhatsApp\\.'); }
+    if (sids.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired!'); }
+    if (!sids.data?.length) { isRunning = false; return sendMsg(chatId, '⚠️ Tidak ada SID WhatsApp.'); }
 
     const sid = sids.data[0];
-    await sendMsg(chatId,
-      `✅ *SID Terbaru:*\n` +
-      `• Range: \`${escMd(sid.range)}\`\n` +
-      `• SID: \`${escMd(sid.originator)}\`\n` +
-      `• No: \`${escMd(sid.test_number||'-')}\`\n` +
-      `• Pesan: \`${escMd((sid.messagedata||'-').substring(0,50))}\`\n` +
-      `• Waktu: \`${escMd(sid.senttime)}\``
-    );
+    await sendMsg(chatId, `✅ <b>SID Terbaru:</b>\n• Range: <code>${esc(sid.range)}</code>\n• SID: <code>${esc(sid.originator)}</code>\n• No: <code>${esc(sid.test_number||'-')}</code>\n• Waktu: <code>${esc(sid.senttime)}</code>`);
 
-    // [3/5] Cari range di Test Numbers
-    await sendMsg(chatId, `🔍 *\\[3/5\\]* Mencari range di Test Numbers\\.\\.\\. `);
+    await sendMsg(chatId, `🔍 <b>[3/5]</b> Mencari range di Test Numbers...`);
     const testNums = await getTestNumbers(cookie, sid.range);
-    if (testNums.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie'); }
-    if (!testNums.data?.length) { isRunning = false; return sendMsg(chatId, `⚠️ Range "${escMd(sid.range)}" tidak ditemukan\\.`); }
+    if (testNums.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired!'); }
+    if (!testNums.data?.length) { isRunning = false; return sendMsg(chatId, `⚠️ Range "${esc(sid.range)}" tidak ditemukan.`); }
 
     const target = testNums.data[0];
     const rangeId = extractIdFromAction(target.action);
-    if (!rangeId) { isRunning = false; return sendMsg(chatId, '⚠️ Gagal ekstrak ID dari action\\.'); }
+    if (!rangeId) { isRunning = false; return sendMsg(chatId, '⚠️ Gagal ekstrak ID.'); }
 
-    await sendMsg(chatId,
-      `✅ *Range:* \`${escMd(target.range)}\`\n` +
-      `• No: \`${escMd(target.test_number)}\` | Rate: \`${escMd(target.A2P||'-')}\`\n` +
-      `• ID: \`${rangeId}\``
-    );
+    await sendMsg(chatId, `✅ <b>Range Ditemukan:</b>\n• No: <code>${esc(target.test_number)}</code>\n• ID: <code>${rangeId}</code>`);
 
-    // [4/5] Add number
-    await sendMsg(chatId, `➕ *\\[4/5\\]* Add number ID ${rangeId}\\.\\.\\. `);
+    await sendMsg(chatId, `➕ <b>[4/5]</b> Add number ID ${rangeId}...`);
     await sleep(2000);
     const addRes = await addNumber(cookie, rangeId);
-    if (addRes.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie'); }
-    await sendMsg(chatId, `✅ ${escMd(addRes.message || 'Berhasil add number')}`);
+    if (addRes.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired!'); }
+    await sendMsg(chatId, `✅ ${esc(addRes.message || 'Berhasil add number')}`);
     await sleep(5000);
 
-    // [5/5] Ambil nomor yang di-assign → simpan ke numbers.txt
-    await sendMsg(chatId, `📋 *\\[5/5\\]* Mengambil nomor yang di\\-assign\\.\\.\\. `);
+    await sendMsg(chatId, `📋 <b>[5/5]</b> Mengambil nomor yang di-assign...`);
     const assigned = await getAssignedNumbers(cookie, target.range);
-    if (assigned.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie'); }
+    if (assigned.expired) { isRunning = false; return sendMsg(chatId, '🔴 Cookie expired!'); }
 
     let numbersToSave = [];
     if (assigned.data?.length > 0) {
-      numbersToSave = assigned.data.map(n => ({
-        number: n.Number || n.number || '',
-        range: n.range || target.range
-      })).filter(n => n.number);
+      numbersToSave = assigned.data.map(n => ({ number: n.Number || n.number || '', range: n.range || target.range })).filter(n => n.number);
     }
-
-    // Fallback ke test_number kalau kosong
-    if (numbersToSave.length === 0) {
-      numbersToSave = [{ number: target.test_number, range: target.range }];
-    }
+    if (numbersToSave.length === 0) numbersToSave = [{ number: target.test_number, range: target.range }];
 
     saveNumbers(numbersToSave);
 
-    let numMsg = `✅ *${numbersToSave.length} Nomor Disimpan ke numbers\\.txt:*\n\n`;
-    for (const n of numbersToSave.slice(0, 10)) {
-      numMsg += `• \`${escMd(n.number)}\` — ${escMd(n.range)}\n`;
-    }
-    if (numbersToSave.length > 10) numMsg += `_\\.\\.\\. dan ${numbersToSave.length - 10} lainnya_`;
+    let numMsg = `✅ <b>${numbersToSave.length} Nomor Tersimpan:</b>\n\n`;
+    for (const n of numbersToSave.slice(0, 10)) numMsg += `• <code>${esc(n.number)}</code> — ${esc(n.range)}\n`;
     await sendMsg(chatId, numMsg);
 
-    // SMS Statistics
-    await sendMsg(chatId, `📊 Mengambil SMS Statistics \\(${today}\\)\\.\\.\\. `);
+    await sendMsg(chatId, `📊 Mengambil SMS Statistics (${today})...`);
     const stats = await getSMSStats(cookie, today, today);
     if (!stats.expired && stats.data) await formatAndSendStats(chatId, stats.data, today);
 
-    // Start monitoring
     startMonitoring(bot, chatId, loadCookie);
-    await sendMsg(chatId,
-      `🟢 *Monitoring Realtime Dimulai\\!*\n` +
-      `• Interval: 30 detik\n` +
-      `• Nomor dipantau: ${numbersToSave.length}\n` +
-      `• Notif otomatis bila ada SMS baru\n\n` +
-      `Gunakan /stopmonitor untuk menghentikan\\.`
-    );
+    await sendMsg(chatId, `🟢 <b>Monitoring Realtime Dimulai!</b>\n• Interval: 30 detik\n• Nomor dipantau: ${numbersToSave.length}\n\n<i>Bot akan mengirim notif bila ada SMS baru.</i>`);
 
   } catch (err) {
     log('Flow error: ' + err.message);
-    await sendMsg(chatId, `❌ *Error:* \`${escMd(err.message)}\``);
+    await sendMsg(chatId, `❌ <b>Error:</b> <code>${esc(err.message)}</code>`);
   } finally {
     isRunning = false;
   }
 }
 
-// ─── COMMANDS ─────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, async (msg) => {
-  await sendMsg(msg.chat.id,
-    `🤖 *iVAS Automation Bot*\n\n` +
-    `Selamat datang! Pilih menu di bawah ini atau gunakan command manual\\.\n` +
-    `Chat ID Anda: \`${msg.chat.id}\``,
+// ─── COMMANDS PINTASAN ────────────────────────────────────────────────────────
+bot.onText(/\/(start|menu)/, async (msg) => {
+  delete userStates[msg.chat.id]; // Reset state jika user panggil menu
+  await sendMsg(msg.chat.id, 
+    `🤖 <b>iVAS Automation Bot</b>\n\nSelamat datang! Silakan klik tombol di bawah ini untuk mengontrol bot.\nID Anda: <code>${msg.chat.id}</code>`, 
     mainKeyboard
   );
 });
 
-bot.onText(/\/run/, async (msg) => { await runFullFlow(msg.chat.id); });
-
-bot.onText(/\/stats/, async (msg) => {
+// ─── TEXT HANDLER (UNTUK INPUT WIZARD) ────────────────────────────────────────
+bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  const cookie = loadCookie();
-  if (!cookie) return sendMsg(chatId, '❌ Cookie belum diset\\.');
-  const today = new Date().toISOString().split('T')[0];
-  await sendMsg(chatId, `📊 Mengambil Statistics \\(${today}\\)\\.\\.\\. `);
-  const stats = await getSMSStats(cookie, today, today);
-  if (stats.expired) return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie');
-  await formatAndSendStats(chatId, stats.data || [], today);
-});
-
-bot.onText(/\/sid/, async (msg) => {
-  const chatId = msg.chat.id;
-  const cookie = loadCookie();
-  if (!cookie) return sendMsg(chatId, '❌ Cookie belum diset\\.');
-  await sendMsg(chatId, '🔍 Mencari SID WhatsApp\\.\\.\\. ');
-  const sids = await getLatestWhatsappSID(cookie);
-  if (sids.expired) return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie');
-  if (!sids.data?.length) return sendMsg(chatId, '⚠️ Tidak ada data\\.');
+  const text = msg.text || '';
   
-  let text = `📱 *SID WhatsApp Terbaru:*\n\n`;
-  for (const [i, s] of sids.data.slice(0, 5).entries()) {
-    text += `*${i+1}\\.* \`${escMd(s.range)}\`\n`; 
-    text += `   SID: \`${escMd(s.originator)}\` | ⏰ ${escMd(s.senttime)}\n\n`;
-  }
-  await sendMsg(chatId, text);
-});
+  if (text.startsWith('/')) return; // Abaikan jika ini command
 
-bot.onText(/\/numbers/, async (msg) => {
-  const chatId = msg.chat.id;
-  const cookie = loadCookie();
-  if (!cookie) return sendMsg(chatId, '❌ Cookie belum diset\\.');
-  const result = await getTestNumbers(cookie, '');
-  if (result.expired) return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie');
-  if (!result.data?.length) return sendMsg(chatId, '⚠️ Tidak ada test numbers\\.');
-  
-  let text = `📋 *Test Numbers \\(Top 10\\):*\n\n`;
-  for (const [i, n] of result.data.slice(0, 10).entries()) {
-    text += `${i+1}\\. \`${escMd(n.range)}\`\n   No: \`${escMd(n.test_number)}\` | Rate: \`${escMd(n.A2P||'-')}\`\n\n`;
-  }
-  await sendMsg(chatId, text);
-});
-
-bot.onText(/\/mynumbers/, async (msg) => {
-  const numbers = loadNumbers();
-  if (!numbers.length) return sendMsg(msg.chat.id, '📋 numbers\\.txt kosong\\. Jalankan /run dulu\\.');
-  let text = `📋 *numbers\\.txt \\(${numbers.length} nomor\\):*\n\n`;
-  for (const [i, n] of numbers.entries()) {
-    text += `${i+1}\\. \`${escMd(n.number)}\` — ${escMd(n.range)}\n`;
-  }
-  await sendMsg(msg.chat.id, text);
-});
-
-bot.onText(/\/monitor/, async (msg) => {
-  const s = getMonitorStatus();
-  let text = `📡 *Status Monitoring:*\n\n`;
-  text += `• Status: ${s.isRunning ? '🟢 Aktif' : '🔴 Nonaktif'}\n`;
-  text += `• Nomor: ${s.numberCount}\n• Interval: 30 detik\n\n`;
-  if (s.numbers.length) {
-    text += `*Nomor dipantau:*\n`;
-    for (const n of s.numbers) text += `• \`${escMd(n.number)}\` — ${escMd(n.range)}\n`;
-  }
-  await sendMsg(msg.chat.id, text);
-});
-
-bot.onText(/\/stopmonitor/, async (msg) => {
-  if (!getMonitorStatus().isRunning) return sendMsg(msg.chat.id, '⚠️ Monitor tidak sedang berjalan\\.');
-  stopMonitoring();
-  await sendMsg(msg.chat.id, '⏹ *Monitor dihentikan\\.*');
-});
-
-bot.onText(/\/returnnumbers/, async (msg) => {
-  const cookie = loadCookie();
-  if (!cookie) return sendMsg(msg.chat.id, '❌ Cookie belum diset\\.');
-  await sendMsg(msg.chat.id, '♻️ Returning semua numbers\\.\\.\\. ');
-  const res = await returnAllNumbers(cookie);
-  if (res.expired) return sendMsg(msg.chat.id, '🔴 Cookie expired\\! /setcookie');
-  await sendMsg(msg.chat.id, `✅ ${escMd(res.message || 'Berhasil')}`);
-});
-
-// ─── PERBAIKAN COMMAND /setcookie (VERSI ULTIMATE) ─────────────────────────
-bot.onText(/\/setcookie([\s\S]+)/, async (msg, match) => {
-  try {
-    const rawInput = match[1].trim();
-    
-    // Gunakan Regex (Scanner) untuk memburu token langsung tanpa memedulikan enter/spasi
-    const xsrfMatch = rawInput.match(/XSRF-TOKEN=([^;\s]+)/i);
-    const sessionMatch = rawInput.match(/ivas_sms_session=([^;\s]+)/i);
-
-    // Cek apakah kedua token berhasil ditemukan di dalam teks
-    if (!xsrfMatch || !sessionMatch) {
-      return await sendMsg(msg.chat.id, '❌ *Gagal:* Tidak menemukan `XSRF-TOKEN` atau `ivas_sms_session` di dalam teks\\! Pastikan keduanya tercopy dengan lengkap\\.');
+  if (userStates[chatId]) {
+    if (userStates[chatId].step === 'AWAITING_XSRF') {
+      const xsrf = cleanToken(text);
+      userStates[chatId].xsrf = xsrf;
+      userStates[chatId].step = 'AWAITING_SESSION';
+      await sendMsg(chatId, "✅ <b>XSRF-TOKEN diterima!</b>\n\nLangkah 2:\nSilakan kirimkan nilai untuk <b>ivas_sms_session</b>:", cancelKeyboard);
+      
+    } else if (userStates[chatId].step === 'AWAITING_SESSION') {
+      const session = cleanToken(text);
+      try {
+        saveCookie({ 'XSRF-TOKEN': userStates[chatId].xsrf, 'ivas_sms_session': session }, "Manual via Bot");
+        delete userStates[chatId]; // Bersihkan state
+        await sendMsg(chatId, "🎉 <b>Sempurna! Cookie berhasil disimpan.</b>\nSistem siap digunakan.", mainKeyboard);
+      } catch (e) {
+        await sendMsg(chatId, `❌ Gagal menyimpan: ${e.message}`, mainKeyboard);
+      }
     }
-
-    // Masukkan hasil ekstraksi ke dalam object
-    const cookieObj = {
-      'XSRF-TOKEN': xsrfMatch[1],
-      'ivas_sms_session': sessionMatch[1]
-    };
-    
-    // Simpan ke cookies.json
-    saveCookie(cookieObj, rawInput);
-    
-    await sendMsg(msg.chat.id, '✅ *Sempurna\\! Cookie berhasil diekstrak dan disimpan\\.* Coba jalankan flow sekarang\\.');
-  } catch (e) {
-    await sendMsg(msg.chat.id, `❌ *Format salah:* ${escMd(e.message)}`);
   }
 });
 
-bot.onText(/\/setcookie$/, async (msg) => {
-  await sendMsg(msg.chat.id,
-    '📋 *Format:*\n\n`/setcookie XSRF\\-TOKEN=eyJ\\.\\.\\.; ivas\\_sms\\_session=eyJ\\.\\.\\.`\n\n' +
-    'Copy dari: F12 → Application → Cookies'
-  );
-});
-
-bot.onText(/\/cron/, async (msg) => {
-  await sendMsg(msg.chat.id,
-    `⏰ *Cron:* \`${escMd(config.cron_schedule||'-')}\`\nStatus: ${config.cron_enabled ? '✅ Aktif' : '❌ Nonaktif'}`
-  );
-});
-
-bot.onText(/\/help/, async (msg) => {
-  await sendMsg(msg.chat.id,
-    `📖 *Panduan Bot:*\n` +
-    `/run — Jalankan flow otomatis\n` +
-    `/stats — Statistik SMS\n` +
-    `/sid — Cek SID terbaru\n` +
-    `/monitor — Status live monitor\n` +
-    `/stopmonitor — Matikan monitor\n` +
-    `/setcookie [cookie] — Update sesi\n\n` +
-    `Atau klik tombol di bawah ini:`,
-    mainKeyboard
-  );
-});
-
-// ─── CALLBACK QUERIES (TOMBOL INTERAKTIF) ─────────────────────────────────────
+// ─── CALLBACK QUERIES (TOMBOL) ────────────────────────────────────────────────
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const data = query.data;
-  
-  // Hapus tanda loading di tombol
-  bot.answerCallbackQuery(query.id);
-  
+  bot.answerCallbackQuery(query.id); // Hapus efek loading
+
   switch (data) {
     case 'run_flow':
       await runFullFlow(chatId);
       break;
+    
+    case 'update_cookie':
+      userStates[chatId] = { step: 'AWAITING_XSRF', xsrf: '' };
+      await sendMsg(chatId, "🛠 <b>Update Cookie Mode</b>\n\nLangkah 1:\nSilakan kirimkan nilai untuk <b>XSRF-TOKEN</b> Anda:", cancelKeyboard);
+      break;
+    
+    case 'cancel_input':
+      delete userStates[chatId];
+      await sendMsg(chatId, "❌ <i>Input dibatalkan.</i>", mainKeyboard);
+      break;
+
     case 'check_stats':
       const cookieStats = loadCookie();
-      if (!cookieStats) return sendMsg(chatId, '❌ Cookie belum diset\\.');
+      if (!cookieStats) return sendMsg(chatId, '❌ Cookie belum diset.');
       const today = new Date().toISOString().split('T')[0];
-      await sendMsg(chatId, `📊 Mengambil Statistics \\(${today}\\)\\.\\.\\. `);
+      await sendMsg(chatId, `📊 Mengambil Statistics (${today})...`);
       const stats = await getSMSStats(cookieStats, today, today);
-      if (stats.expired) return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie');
+      if (stats.expired) return sendMsg(chatId, '🔴 Cookie expired! Silakan Update Cookie.');
       await formatAndSendStats(chatId, stats.data || [], today);
       break;
+
     case 'check_sid':
       const cookieSid = loadCookie();
-      if (!cookieSid) return sendMsg(chatId, '❌ Cookie belum diset\\.');
-      await sendMsg(chatId, '🔍 Mencari SID WhatsApp\\.\\.\\. ');
+      if (!cookieSid) return sendMsg(chatId, '❌ Cookie belum diset.');
+      await sendMsg(chatId, '🔍 Mencari SID WhatsApp...');
       const sids = await getLatestWhatsappSID(cookieSid);
-      if (sids.expired) return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie');
-      if (!sids.data?.length) return sendMsg(chatId, '⚠️ Tidak ada data\\.');
-      let sidText = `📱 *SID WhatsApp Terbaru:*\n\n`;
+      if (sids.expired) return sendMsg(chatId, '🔴 Cookie expired!');
+      if (!sids.data?.length) return sendMsg(chatId, '⚠️ Tidak ada data.');
+      let sidText = `📱 <b>SID WhatsApp Terbaru:</b>\n\n`;
       for (const [i, s] of sids.data.slice(0, 5).entries()) {
-        sidText += `*${i+1}\\.* \`${escMd(s.range)}\`\n   SID: \`${escMd(s.originator)}\` | ⏰ ${escMd(s.senttime)}\n\n`;
+        sidText += `<b>${i+1}.</b> <code>${esc(s.range)}</code>\n   SID: <code>${esc(s.originator)}</code> | ⏰ ${esc(s.senttime)}\n\n`;
       }
       await sendMsg(chatId, sidText);
       break;
+
     case 'check_monitor':
       const s = getMonitorStatus();
-      let monText = `📡 *Status Monitoring:*\n\n• Status: ${s.isRunning ? '🟢 Aktif' : '🔴 Nonaktif'}\n• Nomor: ${s.numberCount}\n\n`;
+      let monText = `📡 <b>Status Monitoring:</b>\n\n• Status: ${s.isRunning ? '🟢 Aktif' : '🔴 Nonaktif'}\n• Nomor dipantau: ${s.numberCount}\n\n`;
+      if (s.numbers.length) {
+        for (const n of s.numbers) monText += `• <code>${esc(n.number)}</code> — ${esc(n.range)}\n`;
+      }
       await sendMsg(chatId, monText);
       break;
+
     case 'stop_monitor':
-      if (!getMonitorStatus().isRunning) return sendMsg(chatId, '⚠️ Monitor tidak sedang berjalan\\.');
+      if (!getMonitorStatus().isRunning) return sendMsg(chatId, '⚠️ Monitor tidak sedang berjalan.');
       stopMonitoring();
-      await sendMsg(chatId, '⏹ *Monitor dihentikan\\.*');
+      await sendMsg(chatId, '⏹ <b>Monitor dihentikan.</b>');
       break;
+
     case 'return_nums':
       const cookieRet = loadCookie();
-      if (!cookieRet) return sendMsg(chatId, '❌ Cookie belum diset\\.');
-      await sendMsg(chatId, '♻️ Returning semua numbers\\.\\.\\. ');
+      if (!cookieRet) return sendMsg(chatId, '❌ Cookie belum diset.');
+      await sendMsg(chatId, '♻️ Returning semua numbers...');
       const res = await returnAllNumbers(cookieRet);
-      if (res.expired) return sendMsg(chatId, '🔴 Cookie expired\\! /setcookie');
-      await sendMsg(chatId, `✅ ${escMd(res.message || 'Berhasil')}`);
+      if (res.expired) return sendMsg(chatId, '🔴 Cookie expired!');
+      await sendMsg(chatId, `✅ ${esc(res.message || 'Berhasil')}`);
       break;
-    case 'help_menu':
-      await sendMsg(chatId, `📖 Fitur siap digunakan\\. Gunakan menu /start untuk memanggil tombol kapan saja\\.`);
+
+    case 'my_numbers':
+      const numbers = loadNumbers();
+      if (!numbers.length) return sendMsg(chatId, '📋 numbers.txt kosong. Jalankan Flow dulu.');
+      let numTxt = `📋 <b>My Numbers (${numbers.length}):</b>\n\n`;
+      for (const [i, n] of numbers.entries()) numTxt += `${i+1}. <code>${esc(n.number)}</code> — ${esc(n.range)}\n`;
+      await sendMsg(chatId, numTxt);
       break;
   }
 });
@@ -500,12 +355,7 @@ if (config.cron_enabled && config.cron_schedule && config.chat_id) {
   log(`✅ Cron aktif: ${config.cron_schedule}`);
 }
 
-// ─── ANTI-CRASH HANDLING ──────────────────────────────────────────────────────
-process.on('uncaughtException', (err) => {
-  log(`⚠️ Uncaught Exception: ${err.message}`);
-});
-process.on('unhandledRejection', (reason, promise) => {
-  log(`⚠️ Unhandled Rejection at: ${promise}, reason: ${reason}`);
-});
+process.on('uncaughtException', (err) => log(`⚠️ Uncaught Exception: ${err.message}`));
+process.on('unhandledRejection', (reason, promise) => log(`⚠️ Unhandled Rejection: ${reason}`));
 
-log('✅ iVAS Bot started');
+log('✅ iVAS Bot started (Full HTML & Buttons Mode)');
