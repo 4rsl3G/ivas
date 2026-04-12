@@ -288,43 +288,68 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
 
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) {
-        await safeEditMessageText(`✅ *Aksi Berhasil*\nSistem telah disinkronkan, namun tidak ada nomor di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        await safeEditMessageText(`✅ *Aksi Berhasil*\nTidak ada nomor di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
 
     if (!sock?.authState?.creds?.registered) {
-        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter status WhatsApp...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-        for (const n of numbersObjArray) {
-            await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
-        }
-        await delay(2000);
+        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor tanpa filter WA...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        
+        // Batch insert tanpa filter
+        const placeholders = numbersObjArray.map(() => '(?, ?, ?)').join(', ');
+        const values = numbersObjArray.flatMap(n => [n.number, chatId, n.range]);
+        await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values);
+        
         await safeEditMessageText(`✅ *Selesai!* ${numbersObjArray.length} nomor tersimpan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
 
-    await safeEditMessageText(`⏳ *Auto-Filter WhatsApp Aktif!*\nMengecek status WA untuk *${numbersObjArray.length}* nomor baru...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-
+    const CONCURRENCY = 20; // Cek 15 nomor sekaligus
     let activeCount = 0;
-    let total = numbersObjArray.length;
     let processed = 0;
+    const total = numbersObjArray.length;
+    const activeNumbers = []; // Kumpulkan dulu, batch insert di akhir
 
-    for (const n of numbersObjArray) {
-        processed++;
-        const jid = `${n.number}@s.whatsapp.net`;
-        try {
-            await delay(250); 
-            const [status] = await sock.onWhatsApp(jid);
-            if (status?.exists) {
-                await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
+    await safeEditMessageText(`⚡ *Super Fast WA Filter Aktif!*\nMengecek *${total}* nomor dengan ${CONCURRENCY}x concurrent...\n\n⏳ Progress: 0 / ${total}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+
+    // Proses dalam chunk paralel
+    for (let i = 0; i < total; i += CONCURRENCY) {
+        const chunk = numbersObjArray.slice(i, i + CONCURRENCY);
+
+        const results = await Promise.allSettled(
+            chunk.map(async (n) => {
+                const jid = `${n.number}@s.whatsapp.net`;
+                try {
+                    const [status] = await sock.onWhatsApp(jid);
+                    if (status?.exists) return n;
+                } catch (e) {}
+                return null;
+            })
+        );
+
+        const batchInsert = [];
+        for (const r of results) {
+            processed++;
+            if (r.status === 'fulfilled' && r.value !== null) {
+                batchInsert.push(r.value);
                 activeCount++;
             }
-        } catch(e) {}
-
-        if (processed % 5 === 0 || processed === total) {
-            safeEditMessageText(`⏳ *Memfilter Nomor WA...*\nProgress: ${processed} / ${total}\n✅ Aktif WA: *${activeCount}* Disimpan ke DB`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
         }
+
+        // Batch insert chunk yang aktif
+        if (batchInsert.length > 0) {
+            const placeholders = batchInsert.map(() => '(?, ?, ?)').join(', ');
+            const values = batchInsert.flatMap(n => [n.number, chatId, n.range]);
+            await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values).catch(() => {});
+        }
+
+        // Update progress tiap chunk
+        safeEditMessageText(`⚡ *Super Fast WA Filter...*\nProgress: ${processed} / ${total}\n✅ Aktif WA: *${activeCount}* Tersimpan`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(() => {});
+
+        await delay(300); // Jeda kecil tiap batch agar WA tidak rate-limit
     }
-    await safeEditMessageText(`✅ *Filter WA Selesai!*\nTotal Ditarik: ${total}\n📲 Aktif WA (Disimpan): *${activeCount}* Nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+
+    await safeEditMessageText(`✅ *Filter WA Selesai!*\nTotal Dicek: ${total}\n📲 Aktif WA Tersimpan: *${activeCount}* Nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 }
 
 (async () => {
