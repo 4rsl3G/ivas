@@ -1050,7 +1050,7 @@ bot.on('callback_query', async (query) => {
     if (action === 'cmd_hunt_wa') {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ *𝗔𝗨𝗧𝗛 𝗥𝗘𝗤𝗨𝗜𝗥𝗘𝗗*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         const acc = activeSessions.get(chatId);
-        const MAX_BUY = 4; 
+        const MAX_BUY = 10; 
         await safeEditMessageText(`🎯 *𝗦𝗡𝗜𝗣𝗘𝗥 𝗘𝗡𝗚𝗜𝗡𝗘 𝗢𝗡𝗟𝗜𝗡𝗘*\n━━━━━━━━━━━━━━━━━━━━━━\nSistem memonitor Live Feed SMS Meta secara background.\nMaksimum payload: ${MAX_BUY} Ranges...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
         const uniqueRanges = new Set();
