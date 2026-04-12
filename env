@@ -13,3 +13,8 @@ POLLING_INTERVAL=30000
 # Username Bot Telegram kamu TANPA @ (Contoh: PansaStudio_Bot). 
 # Ini digunakan untuk link tombol "Kembali ke Panel" di Channel
 BOT_USERNAME=username_bot_kamu
+
+
+REQUIRED_CHANNEL_ID=-100xxxxxxxxxx
+REQUIRED_CHANNEL_LINK=https://t.me/PansaGroupChannel
+
