@@ -14,16 +14,34 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TelegramBot(token, { 
     polling: true,
     request: {
-        family: 4 // Memaksa bot menggunakan IPv4
+        family: 4
     }
 });
 const POLLING_INTERVAL = process.env.POLLING_INTERVAL;
 const BROADCAST_CHANNEL = process.env.BROADCAST_CHANNEL_ID ? process.env.BROADCAST_CHANNEL_ID.trim() : null;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? process.env.ADMIN_CHAT_ID.trim() : null; 
 
-// --- FUNGSI PROTEKSI ADMIN ---
+// ==========================================
+// FUNGSI PROTEKSI ROLE
+// ==========================================
 function isAdmin(chatId) {
     return ADMIN_CHAT_ID && chatId.toString() === ADMIN_CHAT_ID;
+}
+
+// User yang sudah di-whitelist oleh admin (load dari DB)
+const whitelistedUsers = new Set();
+
+async function loadWhitelistedUsers() {
+    const rows = await dbAll('SELECT chat_id FROM whitelisted_users');
+    rows.forEach(r => whitelistedUsers.add(r.chat_id));
+}
+
+function isUser(chatId) {
+    return whitelistedUsers.has(chatId.toString());
+}
+
+function canAccess(chatId) {
+    return isAdmin(chatId) || isUser(chatId);
 }
 
 // ==========================================
@@ -39,21 +57,17 @@ sqlDb.serialize(() => {
     dbRun(`CREATE TABLE IF NOT EXISTS sessions (chat_id TEXT PRIMARY KEY, cookies TEXT, last_total_sms INTEGER DEFAULT -1)`);
     dbRun(`CREATE TABLE IF NOT EXISTS seen_ids (msg_id TEXT PRIMARY KEY, chat_id TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS wa_numbers (number TEXT PRIMARY KEY, chat_id TEXT, range_name TEXT)`);
+    // Tabel user yang di-whitelist oleh admin
+    dbRun(`CREATE TABLE IF NOT EXISTS whitelisted_users (chat_id TEXT PRIMARY KEY, username TEXT, added_at TEXT)`);
+    // Tabel nomor yang sedang "dipegang" oleh user (agar tidak tabrakan)
+    dbRun(`CREATE TABLE IF NOT EXISTS user_assigned_numbers (user_chat_id TEXT PRIMARY KEY, number TEXT, range_name TEXT, assigned_at TEXT)`);
 });
 
-const userStates = {};
-const jobQueue = new Map();
-
-const SPEED_MODES = {
-    fast:   { batch: 10, delay: 1000 },
-    normal: { batch: 5,  delay: 3000 },
-    slow:   { batch: 2,  delay: 6000 },
-};
-
+const userStates = {}; 
 function getTodayUTC() { return new Date().toISOString().split('T')[0]; }
 
 // ==========================================
-// MODUL 1: IVAS SMS (OTP POLLING & API JSON)
+// MODUL 1: IVAS SMS
 // ==========================================
 
 class IVASAccount {
@@ -243,9 +257,13 @@ async function startIvasSession(chatId) {
     return false;
 }
 
+// Ambil sesi admin aktif (digunakan oleh fitur user)
+function getAdminSession() {
+    return activeSessions.get(ADMIN_CHAT_ID) || null;
+}
+
 // ==========================================
 // MODUL 2: WHATSAPP BAILEYS & AUTO-FILTER DB
-// [UPDATE] Filter WA Bisnis saja, batch 100 nomor
 // ==========================================
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 let sock; let isConnectingWA = false; 
@@ -290,96 +308,75 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
             }
         } else if (connection === 'open') { 
             isConnectingWA = false; 
-            if (msgId || phoneNumberForPairing) await notifyUI('✅ *WhatsApp Berhasil Terhubung!*'); 
+            if (msgId || phoneNumberForPairing) await notifyUI('✅ *WhatsApp Berhasil Terhubung!'); 
         }
     });
 }
 
-// [UPDATE] Filter WA Bisnis saja + batch 100 nomor, fix stuck di progress akhir
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) {
-        await safeEditMessageText(`✅ *Aksi Berhasil*\nSistem telah disinkronkan, namun tidak ada nomor di akun ini.`, {
-            chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup()
-        });
+        await safeEditMessageText(`✅ *Aksi Berhasil*\nTidak ada nomor di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
 
     if (!sock?.authState?.creds?.registered) {
-        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor ke DB tanpa filter status WhatsApp...`, {
-            chat_id: chatId, message_id: msgId, parse_mode: 'Markdown'
-        });
-        for (const n of numbersObjArray) {
-            await dbRun('INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)', [n.number, chatId, n.range]);
-        }
-        await delay(2000);
-        await safeEditMessageText(`✅ *Selesai!* ${numbersObjArray.length} nomor tersimpan.`, {
-            chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup()
-        });
+        await safeEditMessageText(`⚠️ *WA Belum Terhubung!*\nMenyimpan semua *${numbersObjArray.length}* nomor tanpa filter WA...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        
+        const placeholders = numbersObjArray.map(() => '(?, ?, ?)').join(', ');
+        const values = numbersObjArray.flatMap(n => [n.number, chatId, n.range]);
+        await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values);
+        
+        await safeEditMessageText(`✅ *Selesai!* ${numbersObjArray.length} nomor tersimpan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
 
-    const BATCH_SIZE = 100;
-    const total = numbersObjArray.length;
-    let bizCount = 0;
+    const CONCURRENCY = 20;
+    let activeCount = 0;
     let processed = 0;
+    const total = numbersObjArray.length;
 
-    await safeEditMessageText(
-        `⏳ *Filter WA Bisnis Aktif!*\nMengecek *${total}* nomor dalam batch @100...`,
-        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
-    );
+    await safeEditMessageText(`⚡ *Super Fast WA Filter Aktif!*\nMengecek *${total}* nomor dengan ${CONCURRENCY}x concurrent...\n\n⏳ Progress: 0 / ${total}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
-    for (let i = 0; i < total; i += BATCH_SIZE) {
-        const batch = numbersObjArray.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < total; i += CONCURRENCY) {
+        const chunk = numbersObjArray.slice(i, i + CONCURRENCY);
 
-        const results = await Promise.allSettled(batch.map(async (n, idx) => {
-            await delay(idx * 150); // stagger ringan agar tidak flood
-            const jid = `${n.number}@s.whatsapp.net`;
-            try {
-                const [status] = await sock.onWhatsApp(jid);
-                if (!status?.exists) return null;
-                await delay(300); // jeda sebelum cek profil bisnis
-                const bizProfile = await sock.getBusinessProfile(jid).catch(() => null);
-                if (bizProfile && Object.keys(bizProfile).length > 0) {
-                    return { number: n.number, range: n.range };
-                }
-            } catch (e) {}
-            return null;
-        }));
+        const results = await Promise.allSettled(
+            chunk.map(async (n) => {
+                const jid = `${n.number}@s.whatsapp.net`;
+                try {
+                    const [status] = await sock.onWhatsApp(jid);
+                    if (status?.exists) return n;
+                } catch (e) {}
+                return null;
+            })
+        );
 
+        const batchInsert = [];
         for (const r of results) {
-            if (r.status === 'fulfilled' && r.value) {
-                await dbRun(
-                    'INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES (?, ?, ?)',
-                    [r.value.number, chatId, r.value.range]
-                );
-                bizCount++;
+            processed++;
+            if (r.status === 'fulfilled' && r.value !== null) {
+                batchInsert.push(r.value);
+                activeCount++;
             }
         }
 
-        processed += batch.length;
-
-        // Hanya update progress jika BUKAN batch terakhir
-        // agar tidak tabrakan dengan pesan final
-        if (processed < total) {
-            await safeEditMessageText(
-                `⏳ *Filter WA Bisnis...*\nProgress: ${processed} / ${total}\n🏢 Bisnis Tersimpan: *${bizCount}*`,
-                { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
-            ).catch(() => {});
-            await delay(1500); // jeda antar batch
+        if (batchInsert.length > 0) {
+            const placeholders = batchInsert.map(() => '(?, ?, ?)').join(', ');
+            const values = batchInsert.flatMap(n => [n.number, chatId, n.range]);
+            await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values).catch(() => {});
         }
+
+        safeEditMessageText(`⚡ *Super Fast WA Filter...*\nProgress: ${processed} / ${total}\n✅ Aktif WA: *${activeCount}* Tersimpan`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(() => {});
+
+        await delay(300);
     }
 
-    // Delay kecil agar Telegram tidak throttle edit berturutan
-    await delay(500);
-
-    await safeEditMessageText(
-        `✅ *Filter WA Bisnis Selesai!*\nTotal Dicek: ${total}\n🏢 WA Bisnis Disimpan: *${bizCount}* Nomor`,
-        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }
-    );
+    await safeEditMessageText(`✅ *Filter WA Selesai!*\nTotal Dicek: ${total}\n📲 Aktif WA Tersimpan: *${activeCount}* Nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 }
 
 (async () => {
     console.log('[SYSTEM] Menyiapkan Database & Ivasms Sessions...');
+    await loadWhitelistedUsers();
     const sessions = await dbAll('SELECT * FROM sessions');
     for (const session of sessions) {
         const account = new IVASAccount(session.chat_id, JSON.parse(session.cookies));
@@ -394,6 +391,7 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
 // MODUL 3: TELEGRAM UI & ROUTING HANDLERS
 // ==========================================
 
+// Menu Admin - akses penuh
 const getMainMenuMarkup = () => ({
     inline_keyboard: [
         [{ text: '🔑 Login Cookie', callback_data: 'cmd_login' }, { text: '🗃 Sync Data', callback_data: 'cmd_sync_db' }],
@@ -401,7 +399,14 @@ const getMainMenuMarkup = () => ({
         [{ text: '📡 AUTO-SNIPER WA', callback_data: 'cmd_hunt_wa' }, { text: '📱 Ambil Nomor WA', callback_data: 'cmd_get_wa_numbers_0' }],
         [{ text: '🔗 Hubungkan WA', callback_data: 'cmd_wa_login' }, { text: '🔌 Putuskan WA', callback_data: 'cmd_wa_logout' }],
         [{ text: '🗑 Hapus Semua', callback_data: 'cmd_delete_all' }, { text: '🚪 Logout IVAS', callback_data: 'cmd_logout' }],
-        [{ text: '⚙️ Status Sistem', callback_data: 'cmd_status' }]
+        [{ text: '👥 Kelola User', callback_data: 'cmd_manage_users' }, { text: '⚙️ Status Sistem', callback_data: 'cmd_status' }]
+    ]
+});
+
+// Menu User - terbatas
+const getUserMenuMarkup = () => ({
+    inline_keyboard: [
+        [{ text: '📱 Get Number', callback_data: 'user_get_number' }],
     ]
 });
 
@@ -422,16 +427,169 @@ async function safeEditMessageText(text, options) {
     catch (e) { if (!e.message.includes('message is not modified')) console.error(e.message); }
 }
 
+// ==========================================
+// HANDLER /start & /menu
+// ==========================================
 bot.onText(/\/(start|menu)/, async (msg) => {
     const chatId = msg.chat.id.toString();
     bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
     
-    if (!isAdmin(chatId)) return bot.sendMessage(chatId, "⛔ Anda tidak memiliki akses ke bot ini.");
-    
-    const sentMsg = await bot.sendMessage(chatId, `*🤖 Panel Universal Pansa AI*\nManajemen Ivasms & WA Bulk Checker\n\nSilakan pilih menu di bawah ini:`, { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-    userStates[chatId] = { state: 'IDLE', lastMsgId: sentMsg.message_id };
+    if (isAdmin(chatId)) {
+        const sentMsg = await bot.sendMessage(chatId, `*🤖 Panel Universal Pansa AI*\nManajemen Ivasms & WA Bulk Checker\n\nSilakan pilih menu di bawah ini:`, { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        userStates[chatId] = { state: 'IDLE', lastMsgId: sentMsg.message_id };
+    } else if (isUser(chatId)) {
+        const sentMsg = await bot.sendMessage(chatId, `👋 *Selamat Datang!*\nGunakan tombol di bawah untuk mendapatkan nomor dan OTP.`, { parse_mode: 'Markdown', reply_markup: getUserMenuMarkup() });
+        userStates[chatId] = { state: 'IDLE', lastMsgId: sentMsg.message_id };
+    } else {
+        bot.sendMessage(chatId, "⛔ Anda tidak memiliki akses ke bot ini.\nHubungi admin untuk mendapatkan akses.");
+    }
 });
 
+// ==========================================
+// FITUR USER: GET NUMBER + GET OTP POLLING
+// ==========================================
+
+/**
+ * Ambil 1 nomor random dari DB yang belum di-assign ke user lain
+ */
+async function assignRandomNumberToUser(userChatId) {
+    // Cek apakah user sudah punya nomor yang di-assign
+    const existing = await dbGet('SELECT number, range_name FROM user_assigned_numbers WHERE user_chat_id = ?', [userChatId]);
+    if (existing) return existing; // kembalikan nomor yang sudah dipegang
+
+    // Ambil nomor yang TIDAK sedang dipegang user lain
+    const assignedNumbers = await dbAll('SELECT number FROM user_assigned_numbers');
+    const assignedSet = assignedNumbers.map(r => r.number);
+
+    let query, params;
+    if (assignedSet.length > 0) {
+        const placeholders = assignedSet.map(() => '?').join(', ');
+        query = `SELECT number, range_name FROM wa_numbers WHERE number NOT IN (${placeholders}) ORDER BY RANDOM() LIMIT 1`;
+        params = assignedSet;
+    } else {
+        query = `SELECT number, range_name FROM wa_numbers ORDER BY RANDOM() LIMIT 1`;
+        params = [];
+    }
+
+    const row = await dbGet(query, params);
+    if (!row) return null;
+
+    const now = new Date().toISOString();
+    await dbRun(
+        `INSERT OR REPLACE INTO user_assigned_numbers (user_chat_id, number, range_name, assigned_at) VALUES (?, ?, ?, ?)`,
+        [userChatId, row.number, row.range_name, now]
+    );
+
+    return { number: row.number, range_name: row.range_name };
+}
+
+/**
+ * Lepas nomor dari user (setelah selesai/timeout)
+ */
+async function releaseNumberFromUser(userChatId) {
+    await dbRun('DELETE FROM user_assigned_numbers WHERE user_chat_id = ?', [userChatId]);
+}
+
+/**
+ * Cek OTP untuk nomor tertentu (1 kali cek)
+ */
+async function checkOtpForNumber(number, rangeName) {
+    const acc = getAdminSession();
+    if (!acc || !acc.loggedIn) return null;
+
+    const todayStr = getTodayUTC();
+    try {
+        const messages = await acc.getMessages(number, rangeName, todayStr);
+        if (messages && messages.length > 0) {
+            return messages[messages.length - 1]; // Ambil pesan terbaru
+        }
+    } catch (e) {}
+    return null;
+}
+
+// Simpan polling OTP yang sedang aktif per user
+const activeOtpPolling = new Map(); // userChatId -> { interval, msgId, count }
+
+async function startOtpPolling(userChatId, number, rangeName, msgId) {
+    // Hentikan polling sebelumnya jika ada
+    stopOtpPolling(userChatId);
+
+    let attempts = 0;
+    const MAX_ATTEMPTS = 24; // 24 x 5 detik = 2 menit max
+
+    const poll = async () => {
+        attempts++;
+        const elapsed = attempts * 5;
+
+        await safeEditMessageText(
+            `⏳ *Menunggu OTP...*\n\n📱 Nomor: \`${number}\`\n🌍 Region: ${rangeName}\n\n🔄 Pengecekan ke-${attempts}... (${elapsed}s)\n\nSilakan gunakan nomor ini di aplikasi target, OTP akan muncul otomatis.`,
+            { 
+                chat_id: userChatId, 
+                message_id: msgId, 
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: [[{ text: '❌ Batalkan', callback_data: 'user_cancel_otp' }]] }
+            }
+        ).catch(() => {});
+
+        const msg = await checkOtpForNumber(number, rangeName);
+        
+        if (msg) {
+            stopOtpPolling(userChatId);
+            const otpMatch = msg.text.match(/\b\d{4,8}\b/g);
+            const otp = otpMatch ? otpMatch[0] : null;
+            
+            let replyText = `✅ *OTP DITEMUKAN!*\n\n📱 Nomor: \`${number}\`\n📨 Dari: ${msg.sender}\n⏱ Waktu: ${msg.time} (UTC)\n\n💬 *Pesan:*\n_${msg.text}_`;
+            if (otp) replyText += `\n\n━━━━━━━━━━━━━━━━━━\n🔑 *OTP: \`${otp}\`*\n_(Tap untuk copy)_`;
+
+            await safeEditMessageText(replyText, {
+                chat_id: userChatId,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: { 
+                    inline_keyboard: [
+                        otp ? [{ text: `📋 Copy OTP: ${otp}`, callback_data: 'dummy_btn' }] : [],
+                        [{ text: '🔄 Get Nomor Baru', callback_data: 'user_new_number' }, { text: '🔁 Cek OTP Lagi', callback_data: 'user_get_otp' }]
+                    ].filter(r => r.length > 0)
+                }
+            }).catch(() => {});
+            return;
+        }
+
+        if (attempts >= MAX_ATTEMPTS) {
+            stopOtpPolling(userChatId);
+            await safeEditMessageText(
+                `⏰ *Timeout!*\n\nOTP tidak ditemukan setelah 2 menit untuk nomor:\n\`${number}\`\n\nCoba gunakan nomor lain atau periksa aplikasi target.`,
+                { 
+                    chat_id: userChatId, 
+                    message_id: msgId, 
+                    parse_mode: 'Markdown',
+                    reply_markup: { inline_keyboard: [[{ text: '🔄 Ganti Nomor', callback_data: 'user_new_number' }, { text: '🔁 Coba Lagi', callback_data: 'user_get_otp' }]] }
+                }
+            ).catch(() => {});
+            return;
+        }
+
+        // Jadwalkan pengecekan berikutnya dalam 5 detik
+        const timeoutId = setTimeout(poll, 5000);
+        activeOtpPolling.set(userChatId, { timeoutId, msgId });
+    };
+
+    // Mulai polling pertama
+    const timeoutId = setTimeout(poll, 5000);
+    activeOtpPolling.set(userChatId, { timeoutId, msgId });
+}
+
+function stopOtpPolling(userChatId) {
+    const existing = activeOtpPolling.get(userChatId);
+    if (existing) {
+        clearTimeout(existing.timeoutId);
+        activeOtpPolling.delete(userChatId);
+    }
+}
+
+// ==========================================
+// CALLBACK QUERY HANDLER
+// ==========================================
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id.toString();
     const msgId = query.message.message_id;
@@ -439,17 +597,129 @@ bot.on('callback_query', async (query) => {
 
     bot.answerCallbackQuery(query.id);
     
-    if (!isAdmin(chatId)) {
+    if (!canAccess(chatId)) {
         return bot.answerCallbackQuery(query.id, { text: "⛔ Akses ditolak.", show_alert: true });
     }
 
     if (action === 'dummy_btn') return; 
+
+    // ==========================================
+    // CALLBACK KHUSUS USER (non-admin)
+    // ==========================================
+
+    if (action === 'user_get_number' || action === 'user_new_number') {
+        // Kalau minta nomor baru, lepas dulu yang lama
+        if (action === 'user_new_number') {
+            stopOtpPolling(chatId);
+            await releaseNumberFromUser(chatId);
+        }
+
+        const acc = getAdminSession();
+        if (!acc || !acc.loggedIn) {
+            return safeEditMessageText("⚠️ *Sistem belum siap.*\nAdmin belum login ke IVAS. Hubungi admin.", {
+                chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+                reply_markup: getUserMenuMarkup()
+            });
+        }
+
+        await safeEditMessageText("🔄 *Mengambil nomor...*\nMencari nomor yang tersedia untukmu...", {
+            chat_id: chatId, message_id: msgId, parse_mode: 'Markdown'
+        });
+
+        const assigned = await assignRandomNumberToUser(chatId);
+        
+        if (!assigned) {
+            return safeEditMessageText("❌ *Tidak ada nomor tersedia.*\nSemua nomor sedang digunakan. Coba beberapa saat lagi.", {
+                chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: [[{ text: '🔄 Coba Lagi', callback_data: 'user_get_number' }]] }
+            });
+        }
+
+        userStates[chatId] = { ...userStates[chatId], assignedNumber: assigned.number, assignedRange: assigned.range_name };
+
+        await safeEditMessageText(
+            `✅ *Nomor Siap Digunakan!*\n\n📱 Nomor: \`${assigned.number}\`\n🌍 Region: ${assigned.range_name}\n\n💡 _Gunakan nomor ini untuk mendaftar/verifikasi, lalu tekan tombol Get OTP._`,
+            {
+                chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: `📋 Copy: ${assigned.number}`, callback_data: 'dummy_btn' }],
+                        [{ text: '📨 Get OTP', callback_data: 'user_get_otp' }],
+                        [{ text: '🔄 Ganti Nomor', callback_data: 'user_new_number' }]
+                    ]
+                }
+            }
+        );
+        return;
+    }
+
+    if (action === 'user_get_otp') {
+        const state = userStates[chatId];
+        const number = state?.assignedNumber;
+        const rangeName = state?.assignedRange;
+
+        if (!number || !rangeName) {
+            // Cek di DB
+            const assigned = await dbGet('SELECT number, range_name FROM user_assigned_numbers WHERE user_chat_id = ?', [chatId]);
+            if (!assigned) {
+                return safeEditMessageText("❌ *Belum ada nomor.*\nTekan Get Number terlebih dahulu.", {
+                    chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+                    reply_markup: getUserMenuMarkup()
+                });
+            }
+            userStates[chatId] = { ...userStates[chatId], assignedNumber: assigned.number, assignedRange: assigned.range_name };
+        }
+
+        const finalNumber = userStates[chatId]?.assignedNumber;
+        const finalRange = userStates[chatId]?.assignedRange;
+
+        await safeEditMessageText(
+            `🔍 *Memulai polling OTP...*\n\n📱 Nomor: \`${finalNumber}\`\n🌍 Region: ${finalRange}\n\nBot akan mengecek setiap 5 detik...`,
+            { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }
+        );
+
+        startOtpPolling(chatId, finalNumber, finalRange, msgId);
+        return;
+    }
+
+    if (action === 'user_cancel_otp') {
+        stopOtpPolling(chatId);
+        const state = userStates[chatId];
+        return safeEditMessageText(
+            `✋ *Polling dihentikan.*\n\n📱 Nomor masih aktif: \`${state?.assignedNumber || '-'}\``,
+            {
+                chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '📨 Get OTP Lagi', callback_data: 'user_get_otp' }],
+                        [{ text: '🔄 Ganti Nomor', callback_data: 'user_new_number' }]
+                    ]
+                }
+            }
+        );
+    }
+
+    // ==========================================
+    // CALLBACK KHUSUS ADMIN
+    // ==========================================
+    if (!isAdmin(chatId)) return;
+
     if (!userStates[chatId]) userStates[chatId] = { state: 'IDLE', lastMsgId: msgId };
 
-    if (action === 'cmd_login') {
+    if (action === 'cmd_manage_users') {
+        const users = await dbAll('SELECT chat_id, username, added_at FROM whitelisted_users');
+        let text = `👥 *Kelola User*\nTotal: ${users.length} user aktif\n\n`;
+        if (users.length > 0) {
+            users.forEach((u, i) => { text += `${i+1}. ${u.username || 'no username'} (\`${u.chat_id}\`)\n`; });
+        } else {
+            text += '_Belum ada user yang ditambahkan._\n';
+        }
+        text += '\n_Untuk menambah user: `/adduser <chat_id> <username>`_\n_Untuk hapus user: `/removeuser <chat_id>`_';
+        safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'cmd_cancel' }]] } });
+    }
+    else if (action === 'cmd_login') {
         userStates[chatId].state = 'WAITING_COOKIE';
         userStates[chatId].tempCookies = {};
-        
         const markup = {
             inline_keyboard: [
                 [{ text: '✅ Selesai & Login', callback_data: 'cmd_finish_login' }],
@@ -511,17 +781,17 @@ bot.on('callback_query', async (query) => {
             const total = countRow.count;
 
             if (total === 0) {
-                return safeEditMessageText("❌ *Data Kosong*\nBelum ada nomor WA Bisnis aktif yang tersimpan di Database.\n\n_Silakan gunakan fitur Sync Data atau Auto-Sniper terlebih dahulu._", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+                return safeEditMessageText("❌ *Data Kosong*\nBelum ada nomor WA aktif yang tersimpan di Database.\n\n_Silakan gunakan fitur Sync Data atau Auto-Sniper terlebih dahulu._", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
             }
 
             const currentOffset = offset >= total ? 0 : offset;
             const numbers = await dbAll('SELECT number, range_name FROM wa_numbers WHERE chat_id = ? LIMIT ? OFFSET ?', [chatId, limit, currentOffset]);
 
-            let text = `📱 *NOMOR WA BISNIS TERSIMPAN*\nMenampilkan ${currentOffset + 1} - ${Math.min(currentOffset + limit, total)} dari total *${total}* nomor.\n\n💡 _Tap nomor di bawah untuk menyalin (Copy):_\n\n`;
+            let text = `📱 *NOMOR WA AKTIF TERSIMPAN*\nMenampilkan ${currentOffset + 1} - ${Math.min(currentOffset + limit, total)} dari total *${total}* nomor.\n\n💡 _Tap nomor di bawah untuk menyalin (Copy):_\n\n`;
             const inline_keyboard = [];
             
             numbers.forEach((n, i) => {
-                text += `${currentOffset + i + 1}. 🌍 *${n.range_name}*\n   └ 🏢 \`${n.number}\`\n\n`;
+                text += `${currentOffset + i + 1}. 🌍 *${n.range_name}*\n   └ 📱 \`${n.number}\`\n\n`;
                 inline_keyboard.push([{ text: `📋 Copy: ${n.number}`, callback_data: 'dummy_btn' }]);
             });
 
@@ -568,7 +838,6 @@ bot.on('callback_query', async (query) => {
             const existingNums = await dbAll('SELECT number FROM wa_numbers WHERE chat_id = ?', [chatId]);
             const existingSet = new Set(existingNums.map(n => n.number));
             const allMyNumbers = await acc.getMyNumbers();
-            
             const newNumbers = allMyNumbers.filter(n => !existingSet.has(n.number));
             
             if (newNumbers.length > 0) {
@@ -620,7 +889,7 @@ bot.on('callback_query', async (query) => {
             let reply = `✅ *SNIPER BERHASIL!*\nBerhasil menambahkan ${purchasedRanges.length} Range aktif secara otomatis:\n\n`;
             purchasedRanges.forEach((d, i) => { reply += `${i+1}. 🌍 *${d.range}*\n   └ 💵 Rate: +$${d.rate}\n\n`; });
             
-            await safeEditMessageText(reply + `⏳ _Memulai sinkronisasi dan filter WA Bisnis untuk nomor baru..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+            await safeEditMessageText(reply + `⏳ _Memulai sinkronisasi dan filter WA untuk nomor baru..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
             const existingNums = await dbAll('SELECT number FROM wa_numbers WHERE chat_id = ?', [chatId]);
             const existingSet = new Set(existingNums.map(n => n.number));
@@ -642,7 +911,7 @@ bot.on('callback_query', async (query) => {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ Kamu belum login IVAS!", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
         userStates[chatId].state = 'WAITING_NUMBER';
         const countRow = await dbGet('SELECT COUNT(*) as count FROM wa_numbers WHERE chat_id = ?', [chatId]);
-        safeEditMessageText(`🔍 *Cek Inbox Nomor*\nMasukkan nomor telepon (contoh: \`2250787560321\`).\nBot akan mencari OTP yang masuk untuk nomor ini.\n\n_DB WA Bisnis Lokal: ${countRow.count}_`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
+        safeEditMessageText(`🔍 *Cek Inbox Nomor*\nMasukkan nomor telepon (contoh: \`2250787560321\`).\nBot akan mencari OTP yang masuk untuk nomor ini.\n\n_DB Aktif WA Lokal: ${countRow.count}_`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
     }
     else if (action === 'cmd_delete_all') {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ Kamu belum login IVAS!", { chat_id: chatId, message_id: msgId, reply_markup: getMainMenuMarkup() });
@@ -656,6 +925,7 @@ bot.on('callback_query', async (query) => {
         const result = await acc.returnAllNumbers();
         if (result) {
             await dbRun('DELETE FROM wa_numbers WHERE chat_id = ?', [chatId]);
+            await dbRun('DELETE FROM user_assigned_numbers'); // Bersihkan semua assignment
             safeEditMessageText(`✅ *Berhasil!*\n${result.message || `Berhasil mengembalikan nomor ke sistem.`}\n\n_Database lokal dibersihkan._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         } else {
             safeEditMessageText("❌ *Gagal menghapus nomor.*\nTerjadi kesalahan jaringan atau cookie expired.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
@@ -663,7 +933,9 @@ bot.on('callback_query', async (query) => {
     }
     else if (action === 'cmd_status') {
         const countRow = await dbGet('SELECT COUNT(*) as count FROM wa_numbers WHERE chat_id = ?', [chatId]);
-        const statusMsg = `🟢 *IVAS:* ${activeSessions.has(chatId) ? 'AKTIF' : 'OFFLINE'}\n🤖 *BOT WA:* ${sock?.authState?.creds?.registered ? 'TERHUBUNG' : 'DISCONNECTED'}\n🏢 *DB WA Bisnis:* ${countRow.count} Nomor Tersimpan\n⏱ *Auto Polling:* Aktif (10 detik)`;
+        const userCountRow = await dbGet('SELECT COUNT(*) as count FROM whitelisted_users');
+        const assignedCountRow = await dbGet('SELECT COUNT(*) as count FROM user_assigned_numbers');
+        const statusMsg = `🟢 *IVAS:* ${activeSessions.has(chatId) ? 'AKTIF' : 'OFFLINE'}\n🤖 *BOT WA:* ${sock?.authState?.creds?.registered ? 'TERHUBUNG' : 'DISCONNECTED'}\n🗃 *Database:* ${countRow.count} WA Aktif Tersimpan\n👥 *User Aktif:* ${userCountRow.count} user\n📱 *Nomor Digunakan:* ${assignedCountRow.count} sedang dipakai`;
         safeEditMessageText(statusMsg, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
     else if (action === 'cmd_logout') {
@@ -695,7 +967,9 @@ bot.on('callback_query', async (query) => {
     }
     else if (action.startsWith('start_')) {
         if (!sock?.authState?.creds?.registered) return bot.answerCallbackQuery(query.id, { text: '⚠️ WhatsApp belum terhubung!', show_alert: true });
-        const [, jobId, mode] = action.split('_');
+        const parts = action.split('_');
+        const mode = parts[parts.length - 1];
+        const jobId = parts.slice(1, parts.length - 1).join('_');
         const numbersList = jobQueue.get(jobId);
         if (!numbersList) return bot.answerCallbackQuery(query.id, { text: 'Sesi file/nomor kadaluarsa.', show_alert: true });
 
@@ -705,6 +979,46 @@ bot.on('callback_query', async (query) => {
     }
 });
 
+// ==========================================
+// MESSAGE HANDLER (Admin)
+// ==========================================
+bot.onText(/\/adduser (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id.toString();
+    if (!isAdmin(chatId)) return;
+    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+
+    const args = match[1].trim().split(/\s+/);
+    const targetId = args[0];
+    const username = args[1] || 'unknown';
+
+    if (!targetId || isNaN(targetId)) {
+        return bot.sendMessage(chatId, '❌ Format: `/adduser <chat_id> <username>`', { parse_mode: 'Markdown' });
+    }
+
+    await dbRun(
+        'INSERT OR REPLACE INTO whitelisted_users (chat_id, username, added_at) VALUES (?, ?, ?)',
+        [targetId, username, new Date().toISOString()]
+    );
+    whitelistedUsers.add(targetId);
+
+    bot.sendMessage(chatId, `✅ User \`${targetId}\` (${username}) berhasil ditambahkan.`, { parse_mode: 'Markdown' });
+    bot.sendMessage(targetId, `👋 *Akses Diberikan!*\nAdmin telah memberikan akses untukmu.\n\nKetik /start untuk memulai.`, { parse_mode: 'Markdown' }).catch(()=>{});
+});
+
+bot.onText(/\/removeuser (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id.toString();
+    if (!isAdmin(chatId)) return;
+    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+
+    const targetId = match[1].trim();
+    await dbRun('DELETE FROM whitelisted_users WHERE chat_id = ?', [targetId]);
+    await dbRun('DELETE FROM user_assigned_numbers WHERE user_chat_id = ?', [targetId]);
+    stopOtpPolling(targetId);
+    whitelistedUsers.delete(targetId);
+
+    bot.sendMessage(chatId, `✅ User \`${targetId}\` dihapus dari whitelist.`, { parse_mode: 'Markdown' });
+});
+
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id.toString();
     const text = msg.text;
@@ -712,9 +1026,9 @@ bot.on('message', async (msg) => {
     if (!text || text.startsWith('/')) return;
     bot.deleteMessage(chatId, msg.message_id).catch(() => {});
     
-    if (!isAdmin(chatId)) return;
-
+    if (!isAdmin(chatId)) return; // Hanya admin yang bisa input teks
     if (!userStates[chatId]) return;
+
     const { state: currentState, lastMsgId: menuMsgId } = userStates[chatId];
 
     if (currentState === 'WAITING_COOKIE') {
@@ -778,7 +1092,6 @@ bot.on('message', async (msg) => {
         try {
             let foundMsgs = null; let foundC = '';
             
-            // Cek di DB Internal
             const dbRegionRow = await dbGet('SELECT range_name FROM wa_numbers WHERE number = ? AND chat_id = ?', [targetNumber, chatId]);
 
             if (dbRegionRow) {
@@ -811,7 +1124,6 @@ bot.on('message', async (msg) => {
     else if (currentState === 'WAITING_WA_PHONE') {
         userStates[chatId].state = 'IDLE';
         const phoneNumber = text.replace(/\D/g, '');
-        // Validasi nomor global (bebas asal minimal 8 digit)
         if (phoneNumber.length < 8) {
             return safeEditMessageText("❌ Format WA salah! Masukkan nomor lengkap beserta kode negaranya (contoh: 628xxx, 447xxx, 123xxx).", { chat_id: chatId, message_id: menuMsgId, reply_markup: getMainMenuMarkup() });
         }
@@ -858,6 +1170,14 @@ bot.on('document', async (msg) => {
     }
 });
 
+// Speed modes untuk bulk check
+const SPEED_MODES = {
+    fast: { batch: 10, delay: 1000 },
+    normal: { batch: 5, delay: 3000 },
+    slow: { batch: 2, delay: 6000 }
+};
+const jobQueue = new Map();
+
 async function processBulkCheck(numbers, config, chatId, msgId) {
     let resPersonal = "=== WA PERSONAL ===\n\n", resBisnis = "=== WA BISNIS ===\n\n", resUnreg = "=== UNREGISTERED ===\n\n";
     let countP = 0, countB = 0, countU = 0, processed = 0, total = numbers.length;
@@ -877,10 +1197,7 @@ async function processBulkCheck(numbers, config, chatId, msgId) {
     if (countU > 0) bot.sendDocument(chatId, Buffer.from(resUnreg, 'utf-8'), {}, { filename: `Unregistered_${Date.now()}.txt`, contentType: 'text/plain' });
 }
 
-// ==========================================
-// MODUL 4: SMART POLLING
-// [UPDATE] Hanya polling nomor di DB, interval 10 detik
-// ==========================================
+// --- SMART POLLING ---
 async function pollAllAccounts() {
     const today = getTodayUTC();
     const sessions = await dbAll('SELECT * FROM sessions');
@@ -891,61 +1208,38 @@ async function pollAllAccounts() {
         if (!account || !account.loggedIn) continue;
 
         try {
-            // [UPDATE] Ambil hanya nomor yang tersimpan di DB, tidak scan seluruh region
-            const savedNumbers = await dbAll(
-                'SELECT number, range_name FROM wa_numbers WHERE chat_id = ?',
-                [chatId]
-            );
-
-            if (savedNumbers.length === 0) continue;
-
+            const checkData = await account.getCountries(today);
             let hasNew = false;
-
-            for (const row of savedNumbers) {
-                const messages = await account.getMessages(row.number, row.range_name, today);
-
-                for (const msg of messages) {
-                    const msgId = `${msg.phoneNumber}_${msg.time}_${msg.sender}`;
-                    const isSeen = await dbGet(
-                        'SELECT msg_id FROM seen_ids WHERE msg_id = ? AND chat_id = ?',
-                        [msgId, chatId]
-                    );
-
-                    if (!isSeen) {
-                        await dbRun(
-                            'INSERT INTO seen_ids (msg_id, chat_id) VALUES (?, ?)',
-                            [msgId, chatId]
-                        );
-                        hasNew = true;
-                        if (BROADCAST_CHANNEL) {
-                            const card = formatMessageCard(msg, false);
-                            bot.sendMessage(BROADCAST_CHANNEL, card.text, {
-                                parse_mode: 'Markdown',
-                                reply_markup: card.reply_markup
-                            }).catch(() => {});
+            
+            for (const country of checkData.countries) {
+                const numbersInCountry = await account.getNumbers(country, today);
+                for (const number of numbersInCountry) {
+                    const messages = await account.getMessages(number, country, today);
+                    for (const msg of messages) {
+                        const msgId = `${msg.phoneNumber}_${msg.time}_${msg.sender}`;
+                        
+                        const isSeen = await dbGet('SELECT msg_id FROM seen_ids WHERE msg_id = ? AND chat_id = ?', [msgId, chatId]);
+                        
+                        if (!isSeen) {
+                            await dbRun('INSERT INTO seen_ids (msg_id, chat_id) VALUES (?, ?)', [msgId, chatId]);
+                            hasNew = true;
+                            if (BROADCAST_CHANNEL) {
+                                const card = formatMessageCard(msg, false);
+                                bot.sendMessage(BROADCAST_CHANNEL, card.text, { parse_mode: 'Markdown', reply_markup: card.reply_markup }).catch(()=>{});
+                            }
                         }
                     }
                 }
             }
-
-            if (hasNew) {
-                // Bersihkan seen_ids lama, simpan 1000 terakhir per user
-                await dbRun(
-                    `DELETE FROM seen_ids WHERE rowid NOT IN (
-                        SELECT rowid FROM seen_ids WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1000
-                    )`,
-                    [chatId]
-                );
+            
+            if (hasNew) { 
+                await dbRun(`DELETE FROM seen_ids WHERE rowid NOT IN (SELECT rowid FROM seen_ids WHERE chat_id = ? ORDER BY rowid DESC LIMIT 1000)`, [chatId]);
             }
-
         } catch (e) {
-            if (e.response && (e.response.status === 401 || e.response.status === 403)) {
-                account.loggedIn = false;
-                activeSessions.delete(chatId);
+            if (e.response && (e.response.status === 401 || e.response.status === 403)) { 
+                account.loggedIn = false; activeSessions.delete(chatId); 
             }
         }
     }
-
-    // [UPDATE] Hardcode 10 detik, tidak pakai env POLLING_INTERVAL
-    setTimeout(pollAllAccounts, 10000);
+    setTimeout(pollAllAccounts, POLLING_INTERVAL);
 }
