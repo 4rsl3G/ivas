@@ -12,7 +12,8 @@ const {
     useMultiFileAuthState, 
     DisconnectReason, 
     Browsers, 
-    fetchLatestBaileysVersion 
+    fetchLatestBaileysVersion,
+    makeInMemoryStore // Tambahan untuk caching yang aman
 } = require('baileys');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -61,6 +62,18 @@ sqlDb.serialize(() => {
     dbRun(`CREATE TABLE IF NOT EXISTS user_assigned_numbers (user_chat_id TEXT PRIMARY KEY, number TEXT, range_name TEXT, assigned_at TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS used_numbers (number TEXT PRIMARY KEY, user_chat_id TEXT)`);
 });
+
+// --- INIT IN-MEMORY STORE ---
+const store = makeInMemoryStore({ 
+    logger: pino().child({ level: 'silent', stream: 'store' }) 
+});
+
+store.readFromFile('./baileys_store.json');
+
+setInterval(() => {
+    store.writeToFile('./baileys_store.json');
+}, 10_000);
+// ----------------------------
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function getTodayUTC() { return new Date().toISOString().split('T')[0]; }
@@ -393,9 +406,13 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
         auth: state, 
         logger: pino({ level: 'silent' }), 
         markOnlineOnConnect: false, 
+        syncFullHistory: false, // MATIKAN FULL SYNC AGAR AMAN DARI FLAG BANNED
         generateHighQualityLinkPreview: true 
     });
     
+    // Bind memory store ke event socket
+    store.bind(sock.ev);
+
     sock.ev.on('creds.update', saveCreds);
 
     const notifyUI = async (text) => {
