@@ -5,15 +5,7 @@ const axios = require('axios');
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar, Cookie } = require('tough-cookie');
 const cheerio = require('cheerio');
-const pino = require('pino');
 const sqlite3 = require('sqlite3').verbose();
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    DisconnectReason, 
-    Browsers, 
-    fetchLatestBaileysVersion
-} = require('baileys');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TelegramBot(token, { 
@@ -29,16 +21,6 @@ const REQUIRED_CHANNEL_LINK = process.env.REQUIRED_CHANNEL_LINK ? process.env.RE
 const userStates = {}; 
 const activeSessions = new Map();
 const activeOtpPolling = new Map();
-const jobQueue = new Map();
-
-const SPEED_MODES = {
-    fast: { batch: 10, delay: 1000 },
-    normal: { batch: 5, delay: 3000 },
-    slow: { batch: 2, delay: 6000 }
-};
-
-let sock; 
-let isConnectingWA = false;
 
 const sqlDb = new sqlite3.Database('./pansa_bot.db');
 
@@ -56,7 +38,6 @@ sqlDb.serialize(() => {
     dbRun(`CREATE TABLE IF NOT EXISTS sessions (chat_id TEXT PRIMARY KEY, cookies TEXT, last_total_sms INTEGER DEFAULT -1)`);
     dbRun(`CREATE TABLE IF NOT EXISTS seen_ids (msg_id TEXT PRIMARY KEY, chat_id TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS wa_numbers (number TEXT PRIMARY KEY, chat_id TEXT, range_name TEXT)`);
-    // Tabel whitelisted_users sekarang dialihfungsikan untuk melacak semua public user yang pernah start bot
     dbRun(`CREATE TABLE IF NOT EXISTS whitelisted_users (chat_id TEXT PRIMARY KEY, username TEXT, added_at TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS user_assigned_numbers (user_chat_id TEXT PRIMARY KEY, number TEXT, range_name TEXT, assigned_at TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS used_numbers (number TEXT PRIMARY KEY, user_chat_id TEXT)`);
@@ -71,8 +52,8 @@ function isAdmin(chatId) {
 
 // Mengecek apakah user ada di Channel Wajib
 async function checkForceSub(chatId) {
-    if (!REQUIRED_CHANNEL_ID) return true; // Bebas akses jika channel tidak di-set
-    if (isAdmin(chatId)) return true; // Admin selalu bypass
+    if (!REQUIRED_CHANNEL_ID) return true; 
+    if (isAdmin(chatId)) return true; 
 
     try {
         const member = await bot.getChatMember(REQUIRED_CHANNEL_ID, chatId);
@@ -101,8 +82,7 @@ const getMainMenuMarkup = () => ({
     inline_keyboard: [
         [{ text: '🔑 Cookies Auth', callback_data: 'cmd_login' }, { text: '🗃 Sync Database', callback_data: 'cmd_sync_db' }],
         [{ text: '🔍 Global Inbox', callback_data: 'cmd_search' }, { text: '🛒 Browse Range', callback_data: 'cmd_search_range' }],
-        [{ text: '📡 Auto-Snipe WA', callback_data: 'cmd_hunt_wa' }, { text: '📱 Extract Data WA', callback_data: 'cmd_get_wa_numbers_0' }],
-        [{ text: '🔗 Connect Meta', callback_data: 'cmd_wa_login' }, { text: '🔌 Disconnect Meta', callback_data: 'cmd_wa_logout' }],
+        [{ text: '📡 Auto-Snipe IVAS', callback_data: 'cmd_hunt_wa' }, { text: '📱 Check Saved Numbers', callback_data: 'cmd_get_wa_numbers_0' }],
         [{ text: '🗑 Purge All Data', callback_data: 'cmd_delete_all' }, { text: '🚪 Terminate Session', callback_data: 'cmd_logout' }],
         [{ text: '👥 Public Users List', callback_data: 'cmd_manage_users' }, { text: '⚙️ System Health', callback_data: 'cmd_status' }]
     ]
@@ -367,125 +347,21 @@ function getAdminSession() {
     return activeSessions.get(ADMIN_CHAT_ID) || null;
 }
 
-async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_ID, msgId = null) {
-    if (isConnectingWA) return; 
-    isConnectingWA = true;
-
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    const { version } = await fetchLatestBaileysVersion();
-    
-    sock = makeWASocket({ 
-        version, 
-        printQRInTerminal: false, 
-        browser: Browsers.macOS('Chrome'), 
-        auth: state, 
-        logger: pino({ level: 'silent' }), 
-        markOnlineOnConnect: false, 
-        syncFullHistory: false, 
-        generateHighQualityLinkPreview: true 
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    const notifyUI = async (text) => {
-        const opts = { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() };
-        if (msgId) await safeEditMessageText(text, { chat_id: reportChatId, message_id: msgId, ...opts });
-        else if (phoneNumberForPairing) await bot.sendMessage(reportChatId, text, opts).catch(()=>{});
-    };
-
-    if (phoneNumberForPairing && !sock.authState.creds.registered) {
-        await notifyUI(`❖ *𝗠𝗘𝗧𝗔 𝗜𝗡𝗧𝗘𝗚𝗥𝗔𝗧𝗜𝗢𝗡*\n━━━━━━━━━━━━━━━━━━━━━━\n⏳ Menghubungkan ke server...\nMeminta kode pairing untuk: \`${phoneNumberForPairing}\``);
-        setTimeout(async () => {
-            try {
-                const code = await sock.requestPairingCode(phoneNumberForPairing);
-                const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-                await notifyUI(`✅ *𝗣𝗔𝗜𝗥𝗜𝗡𝗚 𝗖𝗢𝗗𝗘 𝗥𝗘𝗔𝗗𝗬*\n━━━━━━━━━━━━━━━━━━━━━━\n🔑 \`${formattedCode}\`\n\n1️⃣ Buka WhatsApp di perangkat utama\n2️⃣ Navigasi ke *Linked Devices*\n3️⃣ Pilih *Link with phone number instead*\n4️⃣ Masukkan kode di atas.`);
-            } catch (error) { 
-                await notifyUI(`❌ *ERROR: Request Gagal*\n${error.message}`); 
-                isConnectingWA = false; 
-            }
-        }, 4000); 
-    }
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        
-        if (connection === 'close') {
-            isConnectingWA = false;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            
-            if (statusCode !== DisconnectReason.loggedOut) {
-                setTimeout(() => startWA(null, reportChatId, msgId), 5000); 
-            } else { 
-                if (msgId) await notifyUI("❌ *𝗦𝗘𝗦𝗦𝗜𝗢𝗡 𝗧𝗘𝗥𝗠𝗜𝗡𝗔𝗧𝗘𝗗*\nWhatsApp telah diputuskan dari perangkat.");
-                if (fs.existsSync('./auth_info_baileys')) fs.rmSync('./auth_info_baileys', { recursive: true, force: true }); 
-                sock = null; 
-            }
-        } else if (connection === 'open') { 
-            isConnectingWA = false; 
-            if (msgId || phoneNumberForPairing) await notifyUI('✅ *𝗠𝗘𝗧𝗔 𝗦𝗬𝗡𝗖 𝗦𝗨𝗖𝗖𝗘𝗦𝗦*\nKoneksi WhatsApp berhasil dibangun.'); 
-        }
-    });
-}
-
+// FUNGSI UPDATE: Langsung inject data dari IVASMS ke Database tanpa checking Baileys
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId) {
     if (!numbersObjArray || numbersObjArray.length === 0) {
         await safeEditMessageText(`✅ *𝗔𝗖𝗧𝗜𝗢𝗡 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘*\nData kosong. Tidak ada nomor di akun ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
     }
 
-    if (!sock?.authState?.creds?.registered) {
-        await safeEditMessageText(`⚠️ *𝗠𝗘𝗧𝗔 𝗗𝗜𝗦𝗖𝗢𝗡𝗡𝗘𝗖𝗧𝗘𝗗*\nMemotong tahapan filter WhatsApp...\nMenyimpan *${numbersObjArray.length}* nomor mentah ke dalam database...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-        
-        const placeholders = numbersObjArray.map(() => '(?, ?, ?)').join(', ');
-        const values = numbersObjArray.flatMap(n => [n.number, chatId, n.range]);
-        await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values);
-        
-        await safeEditMessageText(`✅ *𝗦𝗬𝗡𝗖 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘*\n${numbersObjArray.length} data berhasil diamankan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        return;
-    }
-
-    const CONCURRENCY = 20;
-    let activeCount = 0;
-    let processed = 0;
-    const total = numbersObjArray.length;
-
-    await safeEditMessageText(`⚡ *𝗔𝗨𝗧𝗢-𝗙𝗜𝗟𝗧𝗘𝗥 𝗘𝗡𝗚𝗜𝗡𝗘 𝗔𝗖𝗧𝗜𝗩𝗘*\nMemproses *${total}* threads secara konkuren...\n\n⏳ Progress: 0 / ${total}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-
-    for (let i = 0; i < total; i += CONCURRENCY) {
-        const chunk = numbersObjArray.slice(i, i + CONCURRENCY);
-
-        const results = await Promise.allSettled(
-            chunk.map(async (n) => {
-                const jid = `${n.number}@s.whatsapp.net`;
-                try {
-                    const [status] = await sock.onWhatsApp(jid);
-                    if (status?.exists) return n;
-                } catch (e) {}
-                return null;
-            })
-        );
-
-        const batchInsert = [];
-        for (const r of results) {
-            processed++;
-            if (r.status === 'fulfilled' && r.value !== null) {
-                batchInsert.push(r.value);
-                activeCount++;
-            }
-        }
-
-        if (batchInsert.length > 0) {
-            const placeholders = batchInsert.map(() => '(?, ?, ?)').join(', ');
-            const values = batchInsert.flatMap(n => [n.number, chatId, n.range]);
-            await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values).catch(() => {});
-        }
-
-        safeEditMessageText(`⚡ *𝗔𝗨𝗧𝗢-𝗙𝗜𝗟𝗧𝗘𝗥 𝗘𝗡𝗚𝗜𝗡𝗘...*\nProgress: ${processed} / ${total}\n✅ Verified Meta Data: *${activeCount}*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(() => {});
-        await delay(300);
-    }
-
-    await safeEditMessageText(`✅ *𝗙𝗜𝗟𝗧𝗘𝗥 𝗢𝗣𝗘𝗥𝗔𝗧𝗜𝗢𝗡 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘*\n━━━━━━━━━━━━━━━━━━━━━━\nTotal Scan : ${total}\nVerified WA : *${activeCount}* data`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+    await safeEditMessageText(`⚡ *𝗦𝗔𝗩𝗜𝗡𝗚 𝗗𝗔𝗧𝗔𝗦𝗘𝗧*\nMenyimpan *${numbersObjArray.length}* nomor langsung ke dalam database...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+    
+    // Inject langsung seluruh nomor tanpa filter
+    const placeholders = numbersObjArray.map(() => '(?, ?, ?)').join(', ');
+    const values = numbersObjArray.flatMap(n => [n.number, chatId, n.range]);
+    await dbRun(`INSERT OR IGNORE INTO wa_numbers (number, chat_id, range_name) VALUES ${placeholders}`, values);
+    
+    await safeEditMessageText(`✅ *𝗦𝗬𝗡𝗖 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘*\n*${numbersObjArray.length}* data berhasil diamankan ke database lokal.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 }
 
 async function assignRandomNumberToUser(userChatId) {
@@ -612,74 +488,6 @@ async function startOtpPolling(userChatId, number, rangeName, msgId) {
 
     const timeoutId = setTimeout(poll, 5000);
     activeOtpPolling.set(userChatId, { timeoutId, msgId });
-}
-
-async function processBulkCheck(numbers, config, chatId, msgId) {
-    let resPersonal = "=== WA PERSONAL ===\n\n";
-    let resBisnis = "=== WA BISNIS ===\n\n";
-    let resUnreg = "=== UNREGISTERED ===\n\n";
-    
-    let countP = 0, countB = 0, countU = 0;
-    let processed = 0;
-    const total = numbers.length;
-    
-    for (let i = 0; i < total; i += config.batch) {
-        const batch = numbers.slice(i, i + config.batch);
-        
-        const promises = batch.map(async (num, idx) => {
-            await delay(idx * 200); 
-            const jid = `${num}@s.whatsapp.net`; 
-            let result = { num, isReg: false, isBiz: false, bio: '-', desc: '-', cat: '-', dp: '-' };
-            
-            try { 
-                const [status] = await sock.onWhatsApp(jid); 
-                if (status?.exists) { 
-                    result.isReg = true; 
-                    try { result.bio = (await sock.fetchStatus(jid))?.status || '-'; } catch(e){} 
-                    try { result.dp = await sock.profilePictureUrl(jid, 'image') || '-'; } catch(e){} 
-                    
-                    try { 
-                        const biz = await sock.getBusinessProfile(jid); 
-                        if (biz) { 
-                            result.isBiz = true; 
-                            result.desc = biz.description || '-'; 
-                            result.cat = biz.category || '-'; 
-                        } 
-                    } catch(e){} 
-                } 
-            } catch(e) {} 
-            return result;
-        });
-        
-        const batchRes = await Promise.allSettled(promises);
-        
-        batchRes.forEach(r => { 
-            if (r.status === 'fulfilled') { 
-                const v = r.value; 
-                if (v.isReg) { 
-                    if (v.isBiz) { 
-                        resBisnis += `${v.num}\nBio: ${v.bio}\nCat: ${v.cat}\nDesc: ${v.desc}\nDP: ${v.dp}\n---\n`; 
-                        countB++; 
-                    } else { 
-                        resPersonal += `${v.num}\nBio: ${v.bio}\nDP: ${v.dp}\n---\n`; 
-                        countP++; 
-                    } 
-                } else { 
-                    resUnreg += `${v.num}\n`; 
-                    countU++; 
-                } 
-            } 
-        });
-        
-        processed += batch.length; 
-        safeEditMessageText(`⏳ *𝗕𝗨𝗟𝗞 𝗘𝗫𝗧𝗥𝗔𝗖𝗧𝗜𝗢𝗡 𝗔𝗖𝗧𝗜𝗩𝗘*\nProgress: ${processed} / ${total}\n_Cooldown ${config.delay/1000}s..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }); 
-        if (processed < total) await delay(config.delay);
-    }
-    
-    safeEditMessageText(`✅ *𝗘𝗫𝗧𝗥𝗔𝗖𝗧𝗜𝗢𝗡 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘*\n━━━━━━━━━━━━━━━━━━━━━━\n📊 Total Analyzed : ${total}\n👤 Personal : *${countP}*\n🏢 Business : *${countB}*\n❌ Unregistered : *${countU}*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-    if (countP > 0) bot.sendDocument(chatId, Buffer.from(resPersonal, 'utf-8'), {}, { filename: `Personal_Lead_${Date.now()}.txt`, contentType: 'text/plain' });
-    if (countB > 0) bot.sendDocument(chatId, Buffer.from(resBisnis, 'utf-8'), {}, { filename: `Business_Lead_${Date.now()}.txt`, contentType: 'text/plain' });
-    if (countU > 0) bot.sendDocument(chatId, Buffer.from(resUnreg, 'utf-8'), {}, { filename: `Unregistered_${Date.now()}.txt`, contentType: 'text/plain' });
 }
 
 async function pollAllAccounts() {
@@ -965,13 +773,13 @@ bot.on('callback_query', async (query) => {
             const total = countRow.count;
 
             if (total === 0) {
-                return safeEditMessageText("❌ *𝗘𝗠𝗣𝗧𝗬 𝗗𝗔𝗧𝗔𝗦𝗘𝗧*\nDatabase Meta Numbers bersih.\n_Execute module Sync atau Auto-Snipe._", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+                return safeEditMessageText("❌ *𝗘𝗠𝗣𝗧𝗬 𝗗𝗔𝗧𝗔𝗦𝗘𝗧*\nDatabase Numbers bersih.\n_Execute module Sync atau Auto-Snipe._", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
             }
 
             const currentOffset = offset >= total ? 0 : offset;
             const numbers = await dbAll('SELECT number, range_name FROM wa_numbers WHERE chat_id = ? LIMIT ? OFFSET ?', [chatId, limit, currentOffset]);
 
-            let text = `📱 *𝗩𝗘𝗥𝗜𝗙𝗜𝗘𝗗 𝗠𝗘𝗧𝗔 𝗗𝗔𝗧𝗔𝗦𝗘𝗧*\n━━━━━━━━━━━━━━━━━━━━━━\nShowing ${currentOffset + 1} - ${Math.min(currentOffset + limit, total)} of *${total}* records.\n\n`;
+            let text = `📱 *𝗦𝗔𝗩𝗘𝗗 𝗡𝗨𝗠𝗕𝗘𝗥𝗦 𝗗𝗔𝗧𝗔𝗦𝗘𝗧*\n━━━━━━━━━━━━━━━━━━━━━━\nShowing ${currentOffset + 1} - ${Math.min(currentOffset + limit, total)} of *${total}* records.\n\n`;
             const inline_keyboard = [];
             
             numbers.forEach((n, i) => {
@@ -1087,7 +895,7 @@ bot.on('callback_query', async (query) => {
             let reply = `✅ *𝗦𝗡𝗜𝗣𝗘𝗥 𝗘𝗫𝗘𝗖𝗨𝗧𝗜𝗢𝗡 𝗦𝗨𝗖𝗖𝗘𝗦𝗦*\n━━━━━━━━━━━━━━━━━━━━━━\nBerhasil bypass system & secure ${purchasedRanges.length} Node:\n\n`;
             purchasedRanges.forEach((d, i) => { reply += `${i+1}. 🌍 *${d.range}*\n   └ 💵 Yield: +$${d.rate}\n\n`; });
             
-            await safeEditMessageText(reply + `⏳ _Initializing Meta Sync & Routing..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+            await safeEditMessageText(reply + `⏳ _Initializing Fast Sync DB..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
             const existingNums = await dbAll('SELECT number FROM wa_numbers WHERE chat_id = ?', [chatId]);
             const existingSet = new Set(existingNums.map(n => n.number));
@@ -1111,7 +919,7 @@ bot.on('callback_query', async (query) => {
         if (!activeSessions.has(chatId)) return safeEditMessageText("⚠️ *𝗔𝗨𝗧𝗛 𝗥𝗘𝗤𝗨𝗜𝗥𝗘𝗗*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         userStates[chatId].state = 'WAITING_NUMBER';
         const countRow = await dbGet('SELECT COUNT(*) as count FROM wa_numbers WHERE chat_id = ?', [chatId]);
-        safeEditMessageText(`🔍 *𝗚𝗟𝗢𝗕𝗔𝗟 𝗜𝗡𝗕𝗢𝗫 𝗤𝗨𝗘𝗥𝗬*\n━━━━━━━━━━━━━━━━━━━━━━\nMasukkan format string untuk eksekusi regex.\nContoh: \`2250787560321\`\n\n_Local Meta Storage DB: ${countRow.count}_`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
+        safeEditMessageText(`🔍 *𝗚𝗟𝗢𝗕𝗔𝗟 𝗜𝗡𝗕𝗢𝗫 𝗤𝗨𝗘𝗥𝗬*\n━━━━━━━━━━━━━━━━━━━━━━\nMasukkan format string untuk eksekusi regex.\nContoh: \`2250787560321\`\n\n_Local DB Storage: ${countRow.count}_`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
         return;
     }
     
@@ -1148,8 +956,7 @@ bot.on('callback_query', async (query) => {
         const lockedCountRow = await dbGet('SELECT COUNT(*) as count FROM used_numbers');
         
         const statusMsg = `⚙️ *𝗦𝗬𝗦𝗧𝗘𝗠 𝗛𝗘𝗔𝗟𝗧𝗛*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
-                          `🟢 *𝗜𝗩𝗔𝗦 𝗚𝗔𝗧𝗘𝗪𝗔𝗬  :* ${activeSessions.has(chatId) ? 'ONLINE' : 'OFFLINE'}\n` +
-                          `🤖 *𝗠𝗘𝗧𝗔 𝗘𝗡𝗚𝗜𝗡𝗘  :* ${sock?.authState?.creds?.registered ? 'CONNECTED' : 'DISCONNECTED'}\n\n` +
+                          `🟢 *𝗜𝗩𝗔𝗦 𝗚𝗔𝗧𝗘𝗪𝗔𝗬  :* ${activeSessions.has(chatId) ? 'ONLINE' : 'OFFLINE'}\n\n` +
                           `🗃 *𝗟𝗼𝗰𝗮𝗹 𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲 :* ${countRow.count} Secure Nodes\n` +
                           `👥 *𝗣𝘂𝗯𝗹𝗶𝗰 𝗨𝘀𝗲𝗿𝘀  :* ${userCountRow.count} Identities\n` +
                           `📱 *𝗔𝗰𝘁𝗶𝘃𝗲 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀:* ${assignedCountRow.count} Nodes Rented\n` +
@@ -1167,45 +974,10 @@ bot.on('callback_query', async (query) => {
         return;
     }
     
-    if (action === 'cmd_wa_login') {
-        if (fs.existsSync('./auth_info_baileys/creds.json')) return bot.answerCallbackQuery(query.id, { text: 'Meta Socket is already connected.', show_alert: true });
-        userStates[chatId].state = 'WAITING_WA_PHONE';
-        safeEditMessageText("📱 *𝗠𝗘𝗧𝗔 𝗦𝗢𝗖𝗞𝗘𝗧 𝗖𝗢𝗡𝗡𝗘𝗖𝗧𝗜𝗢𝗡*\n━━━━━━━━━━━━━━━━━━━━━━\nInput nomor master root dengan *Country Code*.\n_(Format Murni: 628xxx, 447xxx, tanpa '+' atau '0')_", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
-        return;
-    }
-    
-    if (action === 'cmd_wa_logout') {
-        if (fs.existsSync('./auth_info_baileys/creds.json')) {
-            await safeEditMessageText("⏳ *𝗧𝗘𝗥𝗠𝗜𝗡𝗔𝗧𝗜𝗡𝗚 𝗠𝗘𝗧𝗔 𝗦𝗢𝗖𝗞𝗘𝗧...*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-            try { if (sock) await sock.logout(); } catch(e) {}
-            if (fs.existsSync('./auth_info_baileys')) fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
-            sock = null;
-            isConnectingWA = false;
-            safeEditMessageText("✅ *𝗦𝗢𝗖𝗞𝗘𝗧 𝗖𝗟𝗢𝗦𝗘𝗗*\nSesi lokal dan server berhasil dihapus.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        } else {
-            safeEditMessageText("⚠️ *𝗘𝗥𝗥𝗢𝗥 𝗜𝗡𝗩𝗔𝗟𝗜𝗗 𝗦𝗧𝗔𝗧𝗘*\nSocket tidak ditemukan.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        }
-        return;
-    }
-    
     if (action === 'cmd_cancel') {
         userStates[chatId].state = 'IDLE';
         safeEditMessageText("⚠️ *𝗔𝗖𝗧𝗜𝗢𝗡 𝗔𝗕𝗢𝗥𝗧𝗘𝗗*\n\n❖ *𝗣𝗔𝗡𝗦𝗔 𝗔𝗜 𝗪𝗢𝗥𝗞𝗦𝗣𝗔𝗖𝗘*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         return;
-    }
-    
-    if (action.startsWith('start_')) {
-        if (!sock?.authState?.creds?.registered) return bot.answerCallbackQuery(query.id, { text: '⚠️ Meta Socket terputus!', show_alert: true });
-        const parts = action.split('_');
-        const mode = parts[parts.length - 1];
-        const jobId = parts.slice(1, parts.length - 1).join('_');
-        const numbersList = jobQueue.get(jobId);
-        
-        if (!numbersList) return bot.answerCallbackQuery(query.id, { text: 'File expired dalam memory heap.', show_alert: true });
-
-        safeEditMessageText(`⏳ *𝗜𝗡𝗜𝗧𝗜𝗔𝗧𝗜𝗡𝗚 𝗕𝗨𝗟𝗞 𝗘𝗫𝗧𝗥𝗔𝗖𝗧𝗜𝗢𝗡*\n━━━━━━━━━━━━━━━━━━━━━━\n⚙️ Thread Mode : *${mode.toUpperCase()}*\n📊 Workload : *${numbersList.length}* payloads`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-        processBulkCheck(numbersList, SPEED_MODES[mode], chatId, msgId);
-        jobQueue.delete(jobId);
     }
 });
 
@@ -1314,62 +1086,10 @@ bot.on('message', async (msg) => {
             safeEditMessageText(`⚠️ *𝗦𝗬𝗦𝗧𝗘𝗠 𝗘𝗥𝗥𝗢𝗥*: ${e.message}`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }); 
         }
     }
-    else if (currentState === 'WAITING_WA_PHONE') {
-        userStates[chatId].state = 'IDLE';
-        const phoneNumber = text.replace(/\D/g, '');
-        if (phoneNumber.length < 8) {
-            return safeEditMessageText("❌ *𝗕𝗔𝗗 𝗥𝗘𝗤𝗨𝗘𝗦𝗧*\nParameter kurang. Masukkan string lengkap (eg. 628xxx).", { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        }
-        await safeEditMessageText(`⏳ Deploying listener for \`${phoneNumber}\`...`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown' });
-        startWA(phoneNumber, chatId, menuMsgId);
-    }
-});
-
-bot.on('document', async (msg) => {
-    const chatId = msg.chat.id.toString();
-    if (!isAdmin(chatId)) return;
-    
-    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
-    
-    if (!sock?.authState?.creds?.registered) {
-        const sm = await bot.sendMessage(chatId, '⚠️ Meta Socket terputus!', { reply_markup: getMainMenuMarkup() });
-        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
-        return;
-    }
-    if (!msg.document.file_name.endsWith('.txt')) {
-        const sm = await bot.sendMessage(chatId, '❌ Invalid Mime-Type. TXT Files Only.', { reply_markup: getMainMenuMarkup() });
-        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
-        return;
-    }
-    
-    try {
-        const fileLink = await bot.getFileLink(msg.document.file_id);
-        const res = await axios.get(fileLink);
-        let rawNumbers = res.data.split('\n').map(n => n.replace(/\D/g, '')).filter(n => n.length > 8);
-        const uniqueNumbers = [...new Set(rawNumbers.map(n => n.startsWith('0') ? '62' + n.slice(1) : n))];
-        
-        if (uniqueNumbers.length === 0) {
-            const sm = await bot.sendMessage(chatId, '❌ Null Payload. Gagal mengekstrak data valid.', { reply_markup: getMainMenuMarkup() });
-            if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
-            return;
-        }
-        
-        const jobId = Date.now().toString(); 
-        jobQueue.set(jobId, uniqueNumbers);
-        const sm = await bot.sendMessage(chatId, `📁 *𝗣𝗔𝗬𝗟𝗢𝗔𝗗 𝗔𝗖𝗖𝗘𝗣𝗧𝗘𝗗*\n━━━━━━━━━━━━━━━━━━━━━━\n*${uniqueNumbers.length}* string siap diolah.\n\nPilih konfigurasi *Throttle*:`, { 
-            parse_mode: 'Markdown', 
-            reply_markup: { inline_keyboard: [ [{ text: '🚀 Turbo (Aggressive)', callback_data: `start_${jobId}_fast` }, { text: '🚗 Default (Balanced)', callback_data: `start_${jobId}_normal` }, { text: '🚲 Stealth (Safe)', callback_data: `start_${jobId}_slow` }] ] } 
-        });
-        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
-    } catch (e) { 
-        const sm = await bot.sendMessage(chatId, `❌ *𝗘𝗫𝗖𝗘𝗣𝗧𝗜𝗢𝗡*: ${e.message}`, { reply_markup: getMainMenuMarkup() }); 
-        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
-    }
 });
 
 (async () => {
     console.log('[SYSTEM] Menyiapkan Database & Ivasms Sessions...');
-    // Dihapus fungsi load whitelist karena sudah tidak pakai whitelist
     const sessions = await dbAll('SELECT * FROM sessions');
     for (const session of sessions) {
         const account = new IVASAccount(session.chat_id, JSON.parse(session.cookies));
@@ -1377,7 +1097,5 @@ bot.on('document', async (msg) => {
     }
     
     pollAllAccounts(); 
-    
-    console.log('[SYSTEM] Mengecek Sesi Meta...');
-    if (fs.existsSync('./auth_info_baileys/creds.json')) startWA();
+    console.log('[SYSTEM] Engine Ready - Bot is now running on IVAS Pure Scrape Mode.');
 })();
