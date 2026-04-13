@@ -26,7 +26,6 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? process.env.ADMIN_CHAT_ID.trim
 const REQUIRED_CHANNEL_ID = process.env.REQUIRED_CHANNEL_ID ? process.env.REQUIRED_CHANNEL_ID.trim() : null;
 const REQUIRED_CHANNEL_LINK = process.env.REQUIRED_CHANNEL_LINK ? process.env.REQUIRED_CHANNEL_LINK.trim() : 'https://t.me/yourchannel';
 
-const whitelistedUsers = new Set();
 const userStates = {}; 
 const activeSessions = new Map();
 const activeOtpPolling = new Map();
@@ -57,6 +56,7 @@ sqlDb.serialize(() => {
     dbRun(`CREATE TABLE IF NOT EXISTS sessions (chat_id TEXT PRIMARY KEY, cookies TEXT, last_total_sms INTEGER DEFAULT -1)`);
     dbRun(`CREATE TABLE IF NOT EXISTS seen_ids (msg_id TEXT PRIMARY KEY, chat_id TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS wa_numbers (number TEXT PRIMARY KEY, chat_id TEXT, range_name TEXT)`);
+    // Tabel whitelisted_users sekarang dialihfungsikan untuk melacak semua public user yang pernah start bot
     dbRun(`CREATE TABLE IF NOT EXISTS whitelisted_users (chat_id TEXT PRIMARY KEY, username TEXT, added_at TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS user_assigned_numbers (user_chat_id TEXT PRIMARY KEY, number TEXT, range_name TEXT, assigned_at TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS used_numbers (number TEXT PRIMARY KEY, user_chat_id TEXT)`);
@@ -69,22 +69,10 @@ function isAdmin(chatId) {
     return ADMIN_CHAT_ID && chatId.toString() === ADMIN_CHAT_ID;
 }
 
-function isUser(chatId) {
-    return whitelistedUsers.has(chatId.toString());
-}
-
-function canAccess(chatId) {
-    return isAdmin(chatId) || isUser(chatId);
-}
-
-async function loadWhitelistedUsers() {
-    const rows = await dbAll('SELECT chat_id FROM whitelisted_users');
-    rows.forEach(r => whitelistedUsers.add(r.chat_id));
-}
-
+// Mengecek apakah user ada di Channel Wajib
 async function checkForceSub(chatId) {
-    if (!REQUIRED_CHANNEL_ID) return true; 
-    if (isAdmin(chatId)) return true; 
+    if (!REQUIRED_CHANNEL_ID) return true; // Bebas akses jika channel tidak di-set
+    if (isAdmin(chatId)) return true; // Admin selalu bypass
 
     try {
         const member = await bot.getChatMember(REQUIRED_CHANNEL_ID, chatId);
@@ -95,7 +83,7 @@ async function checkForceSub(chatId) {
 }
 
 async function sendForceSubMessage(chatId, msgId = null) {
-    const text = `🚫 *𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗*\n━━━━━━━━━━━━━━━━━━━━━━\nAkses dibatasi. Anda wajib bergabung dengan *Channel Resmi* kami untuk menggunakan layanan ini.\n\n👇 _Silakan join melalui tautan di bawah:_`;
+    const text = `🚫 *𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗*\n━━━━━━━━━━━━━━━━━━━━━━\nBot ini bersifat publik, namun Anda *wajib bergabung dengan Channel Resmi* kami untuk menggunakan layanannya.\n\n👇 _Silakan join melalui tautan di bawah lalu klik Saya Sudah Join:_`;
     const markup = {
         inline_keyboard: [
             [{ text: '🔗 Join Channel Resmi', url: REQUIRED_CHANNEL_LINK }],
@@ -116,7 +104,7 @@ const getMainMenuMarkup = () => ({
         [{ text: '📡 Auto-Snipe WA', callback_data: 'cmd_hunt_wa' }, { text: '📱 Extract Data WA', callback_data: 'cmd_get_wa_numbers_0' }],
         [{ text: '🔗 Connect Meta', callback_data: 'cmd_wa_login' }, { text: '🔌 Disconnect Meta', callback_data: 'cmd_wa_logout' }],
         [{ text: '🗑 Purge All Data', callback_data: 'cmd_delete_all' }, { text: '🚪 Terminate Session', callback_data: 'cmd_logout' }],
-        [{ text: '👥 User Access', callback_data: 'cmd_manage_users' }, { text: '⚙️ System Health', callback_data: 'cmd_status' }]
+        [{ text: '👥 Public Users List', callback_data: 'cmd_manage_users' }, { text: '⚙️ System Health', callback_data: 'cmd_status' }]
     ]
 });
 
@@ -393,10 +381,7 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
         auth: state, 
         logger: pino({ level: 'silent' }), 
         markOnlineOnConnect: false, 
-        
-        // MATIKAN FULL SYNC AGAR AMAN DARI FLAG SPAM / BANNED
         syncFullHistory: false, 
-        
         generateHighQualityLinkPreview: true 
     });
 
@@ -745,17 +730,24 @@ async function pollAllAccounts() {
 bot.onText(/\/(start|menu)/, async (msg) => {
     const chatId = msg.chat.id.toString();
     bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+
+    // Auto-register public users agar Admin bisa pantau di database
+    if (!isAdmin(chatId)) {
+        await dbRun(
+            'INSERT OR IGNORE INTO whitelisted_users (chat_id, username, added_at) VALUES (?, ?, ?)', 
+            [chatId, msg.from.username || msg.from.first_name || 'Public User', new Date().toISOString()]
+        );
+    }
     
     if (isAdmin(chatId)) {
-        const sentMsg = await bot.sendMessage(chatId, `❖ *𝗣𝗔𝗡𝗦𝗔 𝗔𝗜 𝗪𝗢𝗥𝗞𝗦𝗣𝗔/𝗖𝗘* ❖\n━━━━━━━━━━━━━━━━━━━━━━\nSelamat datang di Control Panel. Silakan pilih modul administrasi di bawah ini:`, { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        const sentMsg = await bot.sendMessage(chatId, `❖ *𝗣𝗔𝗡𝗦𝗔 𝗔𝗜 𝗪𝗢𝗥𝗞𝗦𝗣𝗔𝗖𝗘* ❖\n━━━━━━━━━━━━━━━━━━━━━━\nSelamat datang di Control Panel. Silakan pilih modul administrasi di bawah ini:`, { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         userStates[chatId] = { state: 'IDLE', lastMsgId: sentMsg.message_id };
-    } else if (isUser(chatId)) {
+    } else {
+        // Cek strict force sub untuk user awam
         if (!(await checkForceSub(chatId))) return sendForceSubMessage(chatId);
 
         const sentMsg = await bot.sendMessage(chatId, `❖ *𝗣𝗔𝗡𝗦𝗔 𝗖𝗟𝗜𝗘𝗡𝗧 𝗣𝗢𝗥𝗧𝗔𝗟* ❖\n━━━━━━━━━━━━━━━━━━━━━━\nAkses diverifikasi. Anda terhubung dengan API Infrastruktur kami.\n\n👇 Gunakan modul di bawah untuk memulai:`, { parse_mode: 'Markdown', reply_markup: getUserMenuMarkup() });
         userStates[chatId] = { state: 'IDLE', lastMsgId: sentMsg.message_id };
-    } else {
-        bot.sendMessage(chatId, "🚫 *𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗*\nAnda tidak memiliki izin (whitelist) pada sistem ini.", { parse_mode: 'Markdown' });
     }
 });
 
@@ -765,30 +757,30 @@ bot.on('callback_query', async (query) => {
     const action = query.data;
 
     bot.answerCallbackQuery(query.id);
-    
-    if (!canAccess(chatId)) {
-        return bot.answerCallbackQuery(query.id, { text: "⛔ Akses ditolak.", show_alert: true });
-    }
 
     if (action === 'dummy_btn') return; 
 
+    // Handle verifikasi manual setelah klik tombol 'Saya Sudah Join'
     if (action === 'check_join') {
         const isSubbed = await checkForceSub(chatId);
         if (isSubbed) {
             bot.answerCallbackQuery(query.id, { text: "✅ Verifikasi berhasil! Menginisialisasi sistem..." });
-            const markup = isUser(chatId) && !isAdmin(chatId) ? getUserMenuMarkup() : getMainMenuMarkup();
+            const markup = !isAdmin(chatId) ? getUserMenuMarkup() : getMainMenuMarkup();
             return safeEditMessageText(`❖ *𝗣𝗔𝗡𝗦𝗔 𝗖𝗟𝗜𝗘𝗡𝗧 𝗣𝗢𝗥𝗧𝗔𝗟* ❖\n━━━━━━━━━━━━━━━━━━━━━━\nAkses diverifikasi. Anda terhubung dengan API Infrastruktur kami.\n\n👇 Gunakan modul di bawah untuk memulai:`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: markup });
         } else {
             return bot.answerCallbackQuery(query.id, { text: "❌ Sistem mendeteksi Anda belum berada di Channel!", show_alert: true });
         }
     }
 
-    if (isUser(chatId) && !isAdmin(chatId)) {
+    // STRICT GATE: Pastikan user biasa tidak bisa bypass menu lewat callback lama
+    if (!isAdmin(chatId)) {
         if (!(await checkForceSub(chatId))) {
+            bot.answerCallbackQuery(query.id, { text: "⚠️ Anda keluar dari channel! Akses diblokir.", show_alert: true });
             return sendForceSubMessage(chatId, msgId);
         }
     }
 
+    // --- FITUR PUBLIC USERS ---
     if (action === 'user_get_number' || action === 'user_new_number') {
         if (action === 'user_new_number') {
             stopOtpPolling(chatId);
@@ -799,7 +791,7 @@ bot.on('callback_query', async (query) => {
         if (!acc || !acc.loggedIn) {
             return safeEditMessageText("⚠️ *𝗦𝗬𝗦𝗧𝗘𝗠 𝗢𝗙𝗙𝗟𝗜𝗡𝗘*\nInfrastruktur API belum diinisialisasi oleh Administrator.", {
                 chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
-                reply_markup: getUserMenuMarkup()
+                reply_markup: !isAdmin(chatId) ? getUserMenuMarkup() : getMainMenuMarkup()
             });
         }
 
@@ -849,7 +841,7 @@ bot.on('callback_query', async (query) => {
             if (!assigned) {
                 return safeEditMessageText("❌ *𝗘𝗥𝗥𝗢𝗥 𝗜𝗡𝗩𝗔𝗟𝗜𝗗 𝗦𝗧𝗔𝗧𝗘*\nTidak ada session yang aktif. Tekan Request New Number.", {
                     chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
-                    reply_markup: getUserMenuMarkup()
+                    reply_markup: !isAdmin(chatId) ? getUserMenuMarkup() : getMainMenuMarkup()
                 });
             }
             userStates[chatId] = { ...userStates[chatId], assignedNumber: assigned.number, assignedRange: assigned.range_name };
@@ -884,19 +876,21 @@ bot.on('callback_query', async (query) => {
         );
     }
 
+    // --- FITUR KHUSUS ADMIN ---
     if (!isAdmin(chatId)) return;
 
     if (!userStates[chatId]) userStates[chatId] = { state: 'IDLE', lastMsgId: msgId };
 
     if (action === 'cmd_manage_users') {
-        const users = await dbAll('SELECT chat_id, username, added_at FROM whitelisted_users');
-        let text = `👥 *𝗔𝗖𝗖𝗘𝗦𝗦 𝗠𝗔𝗡𝗔𝗚𝗘𝗠𝗘𝗡𝗧*\n━━━━━━━━━━━━━━━━━━━━━━\nTotal: ${users.length} Active Users\n\n`;
+        // Tampilkan daftar publik user yang sudah pernah menekan start
+        const users = await dbAll('SELECT chat_id, username, added_at FROM whitelisted_users ORDER BY added_at DESC LIMIT 50');
+        const countRow = await dbGet('SELECT COUNT(*) as count FROM whitelisted_users');
+        let text = `👥 *𝗣𝗨𝗕𝗟𝗜𝗖 𝗨𝗦𝗘𝗥 𝗥𝗘𝗖𝗢𝗥𝗗𝗦*\n━━━━━━━━━━━━━━━━━━━━━━\nTotal Unique Users: ${countRow.count}\n\n_50 User Terakhir:_\n`;
         if (users.length > 0) {
-            users.forEach((u, i) => { text += `${i+1}. ${u.username || 'Guest'} (\`${u.chat_id}\`)\n`; });
+            users.forEach((u, i) => { text += `${i+1}. ${u.username} (\`${u.chat_id}\`)\n`; });
         } else {
             text += '_Database kosong._\n';
         }
-        text += '\n_Console commands:_\n└ `/adduser <chat_id> <username>`\n└ `/removeuser <chat_id>`';
         safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Back to Workspace', callback_data: 'cmd_cancel' }]] } });
         return;
     }
@@ -1157,7 +1151,7 @@ bot.on('callback_query', async (query) => {
                           `🟢 *𝗜𝗩𝗔𝗦 𝗚𝗔𝗧𝗘𝗪𝗔𝗬  :* ${activeSessions.has(chatId) ? 'ONLINE' : 'OFFLINE'}\n` +
                           `🤖 *𝗠𝗘𝗧𝗔 𝗘𝗡𝗚𝗜𝗡𝗘  :* ${sock?.authState?.creds?.registered ? 'CONNECTED' : 'DISCONNECTED'}\n\n` +
                           `🗃 *𝗟𝗼𝗰𝗮𝗹 𝗗𝗮𝘁𝗮𝗯𝗮𝘀𝗲 :* ${countRow.count} Secure Nodes\n` +
-                          `👥 *𝗪𝗵𝗶𝘁𝗲𝗹𝗶𝘀𝘁𝗲𝗱   :* ${userCountRow.count} Identities\n` +
+                          `👥 *𝗣𝘂𝗯𝗹𝗶𝗰 𝗨𝘀𝗲𝗿𝘀  :* ${userCountRow.count} Identities\n` +
                           `📱 *𝗔𝗰𝘁𝗶𝘃𝗲 𝗦𝗲𝘀𝘀𝗶𝗼𝗻𝘀:* ${assignedCountRow.count} Nodes Rented\n` +
                           `🔐 *𝗟𝗼𝗰𝗸𝗲𝗱 𝗡𝗼𝗱𝗲𝘀  :* ${lockedCountRow.count} Numbers Bound`;
                           
@@ -1213,43 +1207,6 @@ bot.on('callback_query', async (query) => {
         processBulkCheck(numbersList, SPEED_MODES[mode], chatId, msgId);
         jobQueue.delete(jobId);
     }
-});
-
-bot.onText(/\/adduser (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id.toString();
-    if (!isAdmin(chatId)) return;
-    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
-
-    const args = match[1].trim().split(/\s+/);
-    const targetId = args[0];
-    const username = args[1] || 'Guest';
-
-    if (!targetId || isNaN(targetId)) {
-        return bot.sendMessage(chatId, '❌ Syntax: `/adduser <chat_id> <username>`', { parse_mode: 'Markdown' });
-    }
-
-    await dbRun(
-        'INSERT OR REPLACE INTO whitelisted_users (chat_id, username, added_at) VALUES (?, ?, ?)',
-        [targetId, username, new Date().toISOString()]
-    );
-    whitelistedUsers.add(targetId);
-
-    bot.sendMessage(chatId, `✅ Identity \`${targetId}\` terdaftar dalam sistem.`, { parse_mode: 'Markdown' });
-    bot.sendMessage(targetId, `❖ *𝗦𝗬𝗦𝗧𝗘𝗠 𝗡𝗢𝗧𝗜𝗙𝗜𝗖𝗔𝗧𝗜𝗢𝗡*\n━━━━━━━━━━━━━━━━━━━━━━\nOtorisasi Client diberikan oleh Admin.\n\nKetik /start untuk membuka portal.`, { parse_mode: 'Markdown' }).catch(()=>{});
-});
-
-bot.onText(/\/removeuser (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id.toString();
-    if (!isAdmin(chatId)) return;
-    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
-
-    const targetId = match[1].trim();
-    await dbRun('DELETE FROM whitelisted_users WHERE chat_id = ?', [targetId]);
-    await dbRun('DELETE FROM user_assigned_numbers WHERE user_chat_id = ?', [targetId]);
-    stopOtpPolling(targetId);
-    whitelistedUsers.delete(targetId);
-
-    bot.sendMessage(chatId, `✅ Identity \`${targetId}\` direvoke dari sistem.`, { parse_mode: 'Markdown' });
 });
 
 bot.on('message', async (msg) => {
@@ -1412,7 +1369,7 @@ bot.on('document', async (msg) => {
 
 (async () => {
     console.log('[SYSTEM] Menyiapkan Database & Ivasms Sessions...');
-    await loadWhitelistedUsers();
+    // Dihapus fungsi load whitelist karena sudah tidak pakai whitelist
     const sessions = await dbAll('SELECT * FROM sessions');
     for (const session of sessions) {
         const account = new IVASAccount(session.chat_id, JSON.parse(session.cookies));
