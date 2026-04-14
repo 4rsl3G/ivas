@@ -93,7 +93,7 @@ const getMainMenuMarkup = () => ({
     inline_keyboard: [
         [{ text: '🔑 Tambah Akun IVAS', callback_data: 'cmd_login' }, { text: '🗃 Sinkronisasi Global', callback_data: 'cmd_sync_db' }],
         [{ text: '📢 Siarkan Rentang Aktif', callback_data: 'cmd_active_ranges' }, { text: '🛒 Telusuri Lintas Akun', callback_data: 'cmd_search_range' }],
-        [{ text: '📡 Eksekusi Otomatis (Snipe)', callback_data: 'cmd_hunt_wa' }, { text: '📱 Data Node Meta', callback_data: 'cmd_get_wa_numbers_0' }],
+        [{ text: '📡 Eksekusi Otomatis (Turbo)', callback_data: 'cmd_hunt_wa' }, { text: '📱 Data Node Meta', callback_data: 'cmd_get_wa_numbers_0' }],
         [{ text: '🔗 Hubungkan Meta', callback_data: 'cmd_wa_login' }, { text: '🔌 Putuskan Meta', callback_data: 'cmd_wa_logout' }],
         [{ text: '🗑 Purge Semua Akun', callback_data: 'cmd_delete_all' }, { text: '👥 Pengguna Publik', callback_data: 'cmd_manage_users' }],
         [{ text: '⚙️ Status Server', callback_data: 'cmd_status' }, { text: '🔍 Kotak Masuk Global', callback_data: 'cmd_search' }]
@@ -298,11 +298,9 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     });
 }
 
-// 📌 FUNGSI INI SUDAH DIPERBAIKI DENGAN INDIKATOR MENU
 async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId, accountId) {
     if (!numbersObjArray || numbersObjArray.length === 0) return;
     
-    // Bypass jika meta terputus (Cepat)
     if (!sock?.authState?.creds?.registered) {
         await safeEditMessageText(`⚠️ *META TERPUTUS*\nMenyimpan ${numbersObjArray.length} Node secara instan tanpa filter WA...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
         
@@ -314,7 +312,6 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId, accountI
         return;
     }
 
-    // Filter Meta (Membutuhkan waktu, dilengkapi indikator)
     const CONCURRENCY = 20; let activeCount = 0; let processed = 0; const total = numbersObjArray.length;
     await safeEditMessageText(`⚡ *MESIN PENYARINGAN AKTIF*\nMemproses ${total} data melalui Server WhatsApp...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
@@ -338,12 +335,10 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId, accountI
             await dbRun(`INSERT OR IGNORE INTO wa_nodes (number, account_id, range_name) VALUES ${placeholders}`, values).catch(() => {});
         }
         
-        // Indikator Progress per batch
         safeEditMessageText(`⚡ *MENYARING LINTAS AKUN...*\nAkun ID: ${accountId}\n\n🔄 Progres: ${processed}/${total} Node\n✅ Terverifikasi WA: *${activeCount}*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(() => {});
         await delay(300);
     }
     
-    // Tampilkan Menu Setelah Selesai
     await safeEditMessageText(`✅ *OPERASI PENYARINGAN SELESAI*\n━━━━━━━━━━━━━━━━━━━━━━\nTotal Pemindaian : ${total}\nWA Terverifikasi : *${activeCount}* data\n_(Via Akun ID: ${accountId})_`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 }
 
@@ -588,7 +583,6 @@ bot.on('callback_query', async (query) => {
         if (!cookiesObj['ivas_sms_session']) return safeEditMessageText("❌ *KESALAHAN FATAL*\nParameter `ivas_sms_session` wajib ada.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
         userStates[chatId].state = 'IDLE';
         
-        // 📌 INDIKATOR TAMBAH AKUN
         await safeEditMessageText("⏳ *MENAMBAHKAN AKUN KE DATABASE...*\nSistem sedang memvalidasi sesi...", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
         
         const res = await dbRun('INSERT INTO ivas_accounts (cookies, added_at) VALUES (?, ?)', [JSON.stringify(cookiesObj), new Date().toISOString()]);
@@ -599,7 +593,6 @@ bot.on('callback_query', async (query) => {
             activeSessions.set(accountId, account);
             const myNumbers = await account.getMyNumbers();
             if (myNumbers.length > 0) {
-                // Proses ini akan mengambil alih UI menjadi indikator progress
                 await autoFilterAndSaveNumbers(chatId, myNumbers, msgId, accountId);
             } else {
                 safeEditMessageText(`✅ *AKUN DITAMBAHKAN*\nID Akun: ${accountId}. Node aktif: 0.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
@@ -608,7 +601,6 @@ bot.on('callback_query', async (query) => {
         return;
     }
     
-    // 📌 INDIKATOR SINKRONISASI DATABASE
     if (action === 'cmd_sync_db') {
         if (activeSessions.size === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN IVAS*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         await safeEditMessageText("⏳ *SINKRONISASI LINTAS AKUN*\nMempersiapkan penarikan data dari seluruh peladen...", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
@@ -697,20 +689,25 @@ bot.on('callback_query', async (query) => {
         return;
     }
     
-    // 📌 INDIKATOR AUTO-SNIPE
     if (action === 'cmd_hunt_wa') {
         if (activeSessions.size === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN IVAS*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        
         const MAX_BUY = 10; 
-        const maxRetries = 100;
-        await safeEditMessageText(`🎯 *MESIN EKSEKUSI OTOMATIS (DISTRIBUTED)*\nMenginisialisasi pemantauan *Live Feed* lintas akun...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        const MAX_RETRIES = 100; 
+        
+        await safeEditMessageText(`🎯 *MESIN EKSEKUSI OTOMATIS (TURBO)*\nMenginisialisasi pemantauan *Live Feed* kecepatan tinggi...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
-        const uniqueRanges = new Set(); const purchasedRanges = [];
-        const watcherAcc = Array.from(activeSessions.values())[0]; 
+        const globalUniqueRanges = new Set(); 
+        const purchasedRanges = [];
+        
+        const accountArray = Array.from(activeSessions.entries()); 
+        let currentAccIndex = 0; 
+        
+        const watcherAcc = accountArray[0][1];
 
-        for (let i = 1; i <= maxRetries; i++) {
-            // Update progres UI setiap 3 loop (sekitar 9 detik) untuk menghindari Rate Limit Telegram
+        for (let i = 1; i <= MAX_RETRIES; i++) {
             if (i % 3 === 0 || i === 1) {
-                await safeEditMessageText(`🎯 *MESIN EKSEKUSI OTOMATIS*\nMemantau *Live Feed* lintas akun secara paralel...\n\n🔄 Iterasi Pemantauan: ${i}/${maxRetries}\n📦 Diakuisisi: ${purchasedRanges.length}/${MAX_BUY} Node`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                await safeEditMessageText(`🎯 *MESIN EKSEKUSI OTOMATIS (TURBO)*\nMemantau *Live Feed* secara terpusat...\n\n🔄 Iterasi Pemantauan: ${i}/${MAX_RETRIES}\n📦 Diakuisisi Global: ${purchasedRanges.length}/${MAX_BUY} Node Unik`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
             }
 
             const data = await watcherAcc.fetchLiveTestSMS();
@@ -718,30 +715,43 @@ bot.on('callback_query', async (query) => {
                 const $orig = cheerio.load(item.originator); const sender = $orig('p').text().trim().toLowerCase();
                 
                 if (sender.includes('whatsapp') || sender.includes('wa')) {
-                    if (!uniqueRanges.has(item.range)) {
-                        uniqueRanges.add(item.range);
-                        await safeEditMessageText(`🎯 *TARGET TERKUNCI*\nRange: \`${item.range}\`\n_Mengeksekusi pembelian dengan akun bergiliran..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                    
+                    if (!globalUniqueRanges.has(item.range)) {
+                        globalUniqueRanges.add(item.range); 
                         
-                        for (const [accId, buyerAcc] of activeSessions.entries()) {
-                            const availableNums = await buyerAcc.getTestNumbersByRange(item.range);
-                            if (availableNums.length > 0) {
-                                const buyResult = await buyerAcc.addNumber(availableNums[0].id);
-                                if (buyResult && buyResult.message && buyResult.message.toLowerCase().includes('done')) {
-                                    purchasedRanges.push({ range: item.range, rate: availableNums[0].rate, accountId: accId });
-                                    break; 
-                                }
+                        const [buyerId, buyerAcc] = accountArray[currentAccIndex];
+                        
+                        await safeEditMessageText(`🎯 *TARGET TERKUNCI*\nRange: \`${item.range}\`\n_Mengeksekusi cepat via Akun ID: ${buyerId}..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                        
+                        const availableNums = await buyerAcc.getTestNumbersByRange(item.range);
+                        let success = false;
+
+                        if (availableNums.length > 0) {
+                            const buyResult = await buyerAcc.addNumber(availableNums[0].id);
+                            
+                            if (buyResult && buyResult.message && buyResult.message.toLowerCase().includes('done')) {
+                                purchasedRanges.push({ range: item.range, rate: availableNums[0].rate, accountId: buyerId });
+                                success = true;
+                                
+                                currentAccIndex = (currentAccIndex + 1) % accountArray.length;
                             }
                         }
+                        
+                        if (!success) {
+                            globalUniqueRanges.delete(item.range);
+                        }
+                        
                         if (purchasedRanges.length >= MAX_BUY) break; 
                     }
                 }
             }
             if (purchasedRanges.length >= MAX_BUY) break;
-            if (i < maxRetries) await delay(3000); 
+            
+            if (i < MAX_RETRIES) await delay(2000); 
         }
 
         if (purchasedRanges.length > 0) {
-            let reply = `✅ *EKSEKUSI OTOMATIS SELESAI*\nBerhasil mengamankan ${purchasedRanges.length} Node:\n`;
+            let reply = `✅ *EKSEKUSI TURBO SELESAI*\nBerhasil mengamankan ${purchasedRanges.length} Node Unik Lintas Akun:\n`;
             purchasedRanges.forEach((d, i) => { reply += `${i+1}. *${d.range}* (Via Akun ${d.accountId})\n`; });
             await safeEditMessageText(reply + `\n⏳ _Menginisialisasi Sinkronisasi Meta..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
@@ -754,10 +764,10 @@ bot.on('callback_query', async (query) => {
                 const newNumbers = allMyNumbers.filter(n => !existingSet.has(n.number));
                 if (newNumbers.length > 0) await autoFilterAndSaveNumbers(chatId, newNumbers, msgId, accId);
             }
-            // Menu utama akan dipanggil di dalam fungsi autoFilterAndSaveNumbers jika ada angka baru
-            // Tapi jika tidak ada angka baru yg masuk (hanya beli), panggil manual:
             safeEditMessageText(reply + `\n❖ *SELESAI*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }).catch(()=>{});
-        } else safeEditMessageText(`❌ *OPERASI DIHENTIKAN*\nJaringan sepi / Kalah cepat dari buyer lain pada ${maxRetries} iterasi.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        } else {
+            safeEditMessageText(`❌ *OPERASI DIHENTIKAN*\nSiklus pemantauan selesai. Jaringan saat ini sepi dari *traffic* WhatsApp.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
         return;
     }
     
@@ -852,7 +862,6 @@ bot.on('message', async (msg) => {
         }
     } 
     
-    // 📌 INDIKATOR PENCARIAN RENTANG (RANGE)
     else if (currentState === 'WAITING_RANGE') {
         userStates[chatId].state = 'IDLE'; const targetRange = text.trim(); bot.sendChatAction(chatId, 'typing').catch(()=>{});
         
@@ -881,7 +890,6 @@ bot.on('message', async (msg) => {
         } catch (e) { safeEditMessageText(`⚠️ *KESALAHAN SISTEM*: ${e.message}`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }); }
     }
     
-    // 📌 INDIKATOR PENCARIAN KOTAK MASUK (GLOBAL INBOX)
     else if (currentState === 'WAITING_NUMBER') {
         userStates[chatId].state = 'IDLE'; const targetNumber = text.trim(); const todayStr = getTodayUTC();
         try {
