@@ -715,7 +715,6 @@ bot.on('callback_query', async (query) => {
     if (action === 'cmd_hunt_wa') {
         if (activeSessions.size === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         
-        // Samakan dengan settingan sukses Anda sebelumnya (Beli 4 Nomor)
         const MAX_BUY = 10; 
         const maxRetries = 100; 
         
@@ -724,13 +723,11 @@ bot.on('callback_query', async (query) => {
         const uniqueRanges = new Set();
         const purchasedRanges = [];
         
-        // Setup Multi-Akun
         const accountArray = Array.from(activeSessions.entries()); 
         let currentAccIndex = 0; 
-        const watcherAcc = accountArray[0][1]; // Akun pertama bertugas sebagai radar
+        const watcherAcc = accountArray[0][1]; 
 
         for (let i = 1; i <= maxRetries; i++) {
-            // Update UI diperlambat (setiap 5 putaran) agar tidak diblokir Telegram
             if (i % 5 === 0 || i === 1) {
                 await safeEditMessageText(`🎯 *AUTO-SNIPER WA*\nIterasi: ${i}/${maxRetries}\nBerhasil diambil: ${purchasedRanges.length}/${MAX_BUY}\n_Mencari target..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
             }
@@ -749,7 +746,6 @@ bot.on('callback_query', async (query) => {
                     if (!uniqueRanges.has(item.range)) {
                         uniqueRanges.add(item.range);
                         
-                        // Rotasi Akun: Gunakan akun IVAS secara bergiliran
                         const [buyerId, buyerAcc] = accountArray[currentAccIndex];
                         
                         const availableNums = await buyerAcc.getTestNumbersByRange(item.range);
@@ -757,10 +753,9 @@ bot.on('callback_query', async (query) => {
                             const targetTermId = availableNums[0].id;
                             const buyResult = await buyerAcc.addNumber(targetTermId);
                             
-                            // Validasi sukses seperti kode ori Anda (harus ada kata "done")
                             if (buyResult && buyResult.message && buyResult.message.toLowerCase().includes('done')) {
                                 purchasedRanges.push({ range: item.range, rate: availableNums[0].rate, accountId: buyerId });
-                                currentAccIndex = (currentAccIndex + 1) % accountArray.length; // Pindah ke akun selanjutnya untuk target berikutnya
+                                currentAccIndex = (currentAccIndex + 1) % accountArray.length; 
                             }
                         }
                         if (purchasedRanges.length >= MAX_BUY) break; 
@@ -769,7 +764,6 @@ bot.on('callback_query', async (query) => {
             }
             if (purchasedRanges.length >= MAX_BUY) break;
             
-            // Jeda 3 detik sesuai setingan aman Anda
             if (i < maxRetries) await delay(3000); 
         }
 
@@ -779,7 +773,6 @@ bot.on('callback_query', async (query) => {
             
             await safeEditMessageText(reply + `⏳ _Memulai sinkronisasi dan filter WA untuk nomor baru..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
-            // Sinkronisasi & Filter WA khusus untuk akun-akun yang berhasil mendapat nomor
             const successfulAccIds = [...new Set(purchasedRanges.map(p => p.accountId))];
             for (const accId of successfulAccIds) {
                 const acc = activeSessions.get(accId);
@@ -799,8 +792,8 @@ bot.on('callback_query', async (query) => {
             safeEditMessageText(`❌ *SNIPER SELESAI*\n${reason}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         }
         return;
+    } // <--- KURUNG KURAWAL INI YANG SEBELUMNYA HILANG!
 
-    
     if (action === 'cmd_clean_dead_nodes') {
         if (!sock?.authState?.creds?.registered) return safeEditMessageText("⚠️ *WA TERPUTUS*\nSistem tidak dapat memeriksa nomor mati. Hubungkan WhatsApp dulu.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         const nodes = await dbAll('SELECT number FROM wa_nodes');
