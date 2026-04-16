@@ -714,41 +714,77 @@ bot.on('callback_query', async (query) => {
     
     if (action === 'cmd_hunt_wa') {
         if (activeSessions.size === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        const MAX_BUY = 10; const MAX_RETRIES = 100; 
+        const MAX_BUY = 10; 
+        const MAX_RETRIES = 100; 
+        
         await safeEditMessageText(`🎯 *AUTO-BUY NOMOR WA*\nMencari ketersediaan nomor terbaru di server...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-        const globalUniqueRanges = new Set(); const purchasedRanges = [];
-        const accountArray = Array.from(activeSessions.entries()); let currentAccIndex = 0; const watcherAcc = accountArray[0][1];
+        
+        const globalUniqueRanges = new Set(); 
+        const purchasedRanges = [];
+        const accountArray = Array.from(activeSessions.entries()); 
+        let currentAccIndex = 0; 
+        const watcherAcc = accountArray[0][1]; // Gunakan akun pertama sebagai radar/pengawas
 
         for (let i = 1; i <= MAX_RETRIES; i++) {
-            if (i % 3 === 0 || i === 1) await safeEditMessageText(`🎯 *AUTO-BUY BERJALAN*\nIterasi: ${i}/${MAX_RETRIES}\n📦 Dibeli: ${purchasedRanges.length}/${MAX_BUY} Nomor Unik`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+            // Update UI Counter
+            if (i % 3 === 0 || i === 1) {
+                await safeEditMessageText(`🎯 *AUTO-BUY BERJALAN*\nIterasi: ${i}/${MAX_RETRIES}\n📦 Dibeli: ${purchasedRanges.length}/${MAX_BUY} Nomor Unik\n_Memantau API Ivasms..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+            }
+            
             const data = await watcherAcc.fetchLiveTestSMS();
             for (const item of data) {
-                const textCheck = String(item.originator + ' ' + item.messagedata).toLowerCase();
-                if (textCheck.includes('whatsapp') || textCheck.includes('wa')) {
+                
+                // Ekstraksi aman menggunakan Cheerio (Sama persis dengan kode sukses Anda)
+                let sender = '';
+                try {
+                    const $orig = cheerio.load(item.originator);
+                    sender = $orig('p').text().trim().toLowerCase();
+                } catch(e) {
+                    sender = String(item.originator).toLowerCase();
+                }
+                const messageData = String(item.messagedata).toLowerCase();
+                
+                if (sender.includes('whatsapp') || sender.includes('wa') || messageData.includes('whatsapp')) {
                     if (!globalUniqueRanges.has(item.range)) {
                         globalUniqueRanges.add(item.range); 
                         const [buyerId, buyerAcc] = accountArray[currentAccIndex];
+                        
+                        await safeEditMessageText(`🎯 *DITEMUKAN RANGE WA!*\nNegara: \`${item.range}\`\n⏳ Mengeksekusi Beli via Akun ID: ${buyerId}...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                        
                         const availableNums = await buyerAcc.getTestNumbersByRange(item.range);
                         if (availableNums.length > 0) {
                             const buyResult = await buyerAcc.addNumber(availableNums[0].id);
-                            const responseMsg = String(buyResult?.message || buyResult?.msg || '').toLowerCase();
-                            if (responseMsg.includes('done') || responseMsg.includes('success') || responseMsg.includes('added')) {
+                            
+                            // Validasi ketat wajib "done"
+                            if (buyResult && buyResult.message && buyResult.message.toLowerCase().includes('done')) {
                                 purchasedRanges.push({ range: item.range, rate: availableNums[0].rate, accountId: buyerId });
-                                currentAccIndex = (currentAccIndex + 1) % accountArray.length;
+                                currentAccIndex = (currentAccIndex + 1) % accountArray.length; // Gilir ke akun IVAS berikutnya
+                                
+                                await safeEditMessageText(`✅ *BERHASIL DIBELI*\nNegara: \`${item.range}\`\n_Melanjutkan pencarian..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                                await delay(1000);
+                            } else {
+                                await safeEditMessageText(`❌ *GAGAL MEMBELI*\nNegara: \`${item.range}\`\nAlasan: ${buyResult?.message || 'Limit/Habis'}\n_Melanjutkan pencarian..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                                await delay(1000);
                             }
+                        } else {
+                            await safeEditMessageText(`⚠️ *TELAT*\nNegara: \`${item.range}\` sudah kosong/diambil orang.\n_Melanjutkan pencarian..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }).catch(()=>{});
+                            await delay(1000);
                         }
                         if (purchasedRanges.length >= MAX_BUY) break; 
                     }
                 }
             }
             if (purchasedRanges.length >= MAX_BUY) break;
-            if (i < MAX_RETRIES) await delay(2000); 
+            
+            // Diperlambat menjadi 3 detik agar kebal dari Banned/Rate-Limit Server
+            if (i < MAX_RETRIES) await delay(3000); 
         }
 
         if (purchasedRanges.length > 0) {
-            let reply = `✅ *AUTO-BUY SELESAI*\nBerhasil membeli ${purchasedRanges.length} Nomor:\n`;
-            purchasedRanges.forEach((d, i) => { reply += `${i+1}. *${d.range}*\n`; });
-            await safeEditMessageText(reply + `\n⏳ _Menyimpan ke database..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+            let reply = `✅ *AUTO-BUY SELESAI*\nBerhasil membeli ${purchasedRanges.length} Nomor:\n\n`;
+            purchasedRanges.forEach((d, i) => { reply += `${i+1}. 🌍 *${d.range}* (Via Akun ${d.accountId})\n   └ 💵 Rate: +$${d.rate}\n\n`; });
+            await safeEditMessageText(reply + `⏳ _Menyinkronkan ke database dan mengecek WA..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+            
             const successfulAccIds = [...new Set(purchasedRanges.map(p => p.accountId))];
             for (const accId of successfulAccIds) {
                 const acc = activeSessions.get(accId);
@@ -759,9 +795,13 @@ bot.on('callback_query', async (query) => {
                 if (newNumbers.length > 0) await autoFilterAndSaveNumbers(chatId, newNumbers, msgId, accId);
             }
             safeEditMessageText(reply + `\n❖ *SELESAI*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }).catch(()=>{});
-        } else safeEditMessageText(`❌ *AUTO-BUY SELESAI*\nTidak ada stok nomor WA tersedia di server saat ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        } else {
+            let reason = globalUniqueRanges.size > 0 ? "Menemukan Range WA, namun gagal membeli (saldo habis/limit/kalah cepat)." : "Tidak ada lalu lintas SMS WhatsApp di server saat ini.";
+            safeEditMessageText(`❌ *AUTO-BUY SELESAI*\n${reason}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
         return;
     }
+
     
     if (action === 'cmd_clean_dead_nodes') {
         if (!sock?.authState?.creds?.registered) return safeEditMessageText("⚠️ *WA TERPUTUS*\nSistem tidak dapat memeriksa nomor mati. Hubungkan WhatsApp dulu.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
