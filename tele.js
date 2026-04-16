@@ -454,8 +454,87 @@ async function startOtpPolling(userChatId, number, rangeName, msgId) {
 }
 
 // ─── WORKER LAINNYA ────────────────────────────────────────────────────────
-async function processBulkCheck(numbers, config, chatId, msgId) { /* LOGIKA SAMA SEPERTI SEBELUMNYA */ }
-async function pollAllAccounts() { /* LOGIKA SAMA SEPERTI SEBELUMNYA */ setTimeout(pollAllAccounts, POLLING_INTERVAL); }
+async function processBulkCheck(numbers, config, chatId, msgId) {
+    let resPersonal = "=== WA PERSONAL ===\n\n";
+    let resBisnis = "=== WA BISNIS ===\n\n";
+    let resUnreg = "=== TIDAK TERDAFTAR ===\n\n";
+    
+    let countP = 0, countB = 0, countU = 0; let processed = 0; const total = numbers.length;
+    
+    for (let i = 0; i < total; i += config.batch) {
+        const batch = numbers.slice(i, i + config.batch);
+        
+        const promises = batch.map(async (num, idx) => {
+            await delay(idx * 200); 
+            const jid = `${num}@s.whatsapp.net`; 
+            let result = { num, isReg: false, isBiz: false, bio: '-', desc: '-', cat: '-', dp: '-' };
+            
+            try { 
+                const [status] = await sock.onWhatsApp(jid); 
+                if (status?.exists) { 
+                    result.isReg = true; 
+                    try { result.bio = (await sock.fetchStatus(jid))?.status || '-'; } catch(e){} 
+                    try { result.dp = await sock.profilePictureUrl(jid, 'image') || '-'; } catch(e){} 
+                    
+                    try { 
+                        const biz = await sock.getBusinessProfile(jid); 
+                        if (biz) { result.isBiz = true; result.desc = biz.description || '-'; result.cat = biz.category || '-'; } 
+                    } catch(e){} 
+                } 
+            } catch(e) {} 
+            return result;
+        });
+        
+        const batchRes = await Promise.allSettled(promises);
+        
+        batchRes.forEach(r => { 
+            if (r.status === 'fulfilled') { 
+                const v = r.value; 
+                if (v.isReg) { 
+                    if (v.isBiz) { resBisnis += `${v.num}\nBio: ${v.bio}\nKategori: ${v.cat}\nDeskripsi: ${v.desc}\nDP: ${v.dp}\n---\n`; countB++; } 
+                    else { resPersonal += `${v.num}\nBio: ${v.bio}\nDP: ${v.dp}\n---\n`; countP++; } 
+                } else { resUnreg += `${v.num}\n`; countU++; } 
+            } 
+        });
+        
+        processed += batch.length; 
+        safeEditMessageText(`⏳ *EKSTRAKSI DATA MASSAL BERJALAN*\nProgres: ${processed} / ${total}\n_Jeda sistem ${config.delay/1000} detik..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }); 
+        if (processed < total) await delay(config.delay);
+    }
+    
+    safeEditMessageText(`✅ *EKSTRAKSI SELESAI*\n━━━━━━━━━━━━━━━━━━━━━━\n📊 Total Dianalisis : ${total}\n👤 Akun Personal : *${countP}*\n🏢 Akun Bisnis : *${countB}*\n❌ Tidak Terdaftar : *${countU}*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+    if (countP > 0) bot.sendDocument(chatId, Buffer.from(resPersonal, 'utf-8'), {}, { filename: `Personal_Lead_${Date.now()}.txt`, contentType: 'text/plain' });
+    if (countB > 0) bot.sendDocument(chatId, Buffer.from(resBisnis, 'utf-8'), {}, { filename: `Business_Lead_${Date.now()}.txt`, contentType: 'text/plain' });
+    if (countU > 0) bot.sendDocument(chatId, Buffer.from(resUnreg, 'utf-8'), {}, { filename: `Unregistered_${Date.now()}.txt`, contentType: 'text/plain' });
+}
+
+async function pollAllAccounts() {
+    const today = getTodayUTC();
+    try {
+        for (const [accountId, account] of activeSessions.entries()) {
+            if (!account.loggedIn) continue;
+            try {
+                const checkData = await account.getCountries(today);
+                let hasNew = false;
+                for (const country of checkData.countries) {
+                    const numbersInCountry = await account.getNumbers(country, today);
+                    for (const number of numbersInCountry) {
+                        const messages = await account.getMessages(number, country, today);
+                        for (const msg of messages) {
+                            const msgId = `${msg.phoneNumber}_${msg.time}_${msg.sender}`;
+                            const isSeen = await dbGet('SELECT msg_id FROM seen_ids WHERE msg_id = ? AND account_id = ?', [msgId, accountId]);
+                            if (!isSeen) { await dbRun('INSERT INTO seen_ids (msg_id, account_id) VALUES (?, ?)', [msgId, accountId]); hasNew = true; }
+                        }
+                    }
+                }
+                if (hasNew) await dbRun(`DELETE FROM seen_ids WHERE rowid NOT IN (SELECT rowid FROM seen_ids WHERE account_id = ? ORDER BY rowid DESC LIMIT 1000)`, [accountId]);
+            } catch (e) {
+                if (e.response && (e.response.status === 401 || e.response.status === 403)) { account.loggedIn = false; activeSessions.delete(accountId); }
+            }
+        }
+    } finally { setTimeout(pollAllAccounts, POLLING_INTERVAL); }
+}
+
 
 // ─── TELEGRAM ROUTER ───────────────────────────────────────────────────────
 bot.onText(/\/(start|menu)/, async (msg) => {
