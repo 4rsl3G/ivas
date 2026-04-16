@@ -70,19 +70,17 @@ sqlDb.serialize(() => {
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const getTodayUTC = () => new Date().toISOString().split('T')[0];
 const isAdmin = chatId => ADMIN_CHAT_ID && chatId.toString() === ADMIN_CHAT_ID;
-// Fungsi penting untuk mencegah bot crash akibat format Markdown
 const escapeMarkdown = text => text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
 
 async function safeEditMessageText(text, options) {
     try { await bot.editMessageText(text, options); } catch (e) { if (!e.message.includes('message is not modified')) console.error(e.message); }
 }
 
-// ─── SISTEM FORCE SUB (Bebas Bug 5-Menit) ──────────────────────────────────
+// ─── SISTEM FORCE SUB ──────────────────────────────────────────────────────
 async function checkForceSub(chatId) {
     if (!REQUIRED_CHANNEL_ID || isAdmin(chatId)) return true; 
     const now = Date.now();
     
-    // Hanya gunakan cache jika user SEBELUMNYA SUDAH JOIN (status = true)
     if (forceSubCache.has(chatId)) {
         const cached = forceSubCache.get(chatId);
         if (cached.status === true && (now - cached.timestamp < CACHE_TTL)) return true;
@@ -293,7 +291,7 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
     };
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
         
         if (connection === 'close') {
             isConnectingWA = false;
@@ -308,17 +306,14 @@ async function startWA(phoneNumberForPairing = null, reportChatId = ADMIN_CHAT_I
             if (msgId || phoneNumberForPairing) await notifyUI('✅ *SINKRONISASI WA BERHASIL*'); 
         }
 
-        // Perbaikan Race Condition: Minta kode hanya setelah soket hidup
-        if (phoneNumberForPairing && !sock.authState.creds.registered) {
-            setTimeout(async () => {
-                try {
-                    await notifyUI(`❖ *INTEGRASI WHATSAPP*\n⏳ Meminta kode pemasangan untuk: \`${phoneNumberForPairing}\``);
-                    const code = await sock.requestPairingCode(phoneNumberForPairing);
-                    const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-                    await notifyUI(`✅ *KODE PEMASANGAN SIAP*\n🔑 \`${formattedCode}\`\n\n1️⃣ Buka WA > Perangkat Tertaut\n2️⃣ Tautkan dengan nomor telepon\n3️⃣ Masukkan kode.`);
-                    phoneNumberForPairing = null; // Reset agar tidak looping
-                } catch (error) { await notifyUI(`❌ *GAGAL*\n${error.message}`); isConnectingWA = false; }
-            }, 5000);
+        if (phoneNumberForPairing && !sock.authState.creds.registered && qr) {
+            try {
+                await notifyUI(`❖ *INTEGRASI WHATSAPP*\n⏳ Meminta kode pemasangan untuk: \`${phoneNumberForPairing}\``);
+                const code = await sock.requestPairingCode(phoneNumberForPairing);
+                const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+                await notifyUI(`✅ *KODE PEMASANGAN SIAP*\n🔑 \`${formattedCode}\`\n\n1️⃣ Buka WA > Perangkat Tertaut\n2️⃣ Tautkan dengan nomor telepon\n3️⃣ Masukkan kode.`);
+                phoneNumberForPairing = null; 
+            } catch (error) { await notifyUI(`❌ *GAGAL*\n${error.message}`); isConnectingWA = false; }
         }
     });
 }
@@ -336,7 +331,7 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId, accountI
         return;
     }
 
-    const CONCURRENCY = 5; // Diturunkan dari 20 agar WA tidak diblokir
+    const CONCURRENCY = 5; 
     let activeCount = 0; let processed = 0; const total = numbersObjArray.length;
     await safeEditMessageText(`⚡ *MEMVERIFIKASI NOMOR*\nMemproses ${total} data melalui Server WhatsApp...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
 
@@ -366,7 +361,6 @@ async function autoFilterAndSaveNumbers(chatId, numbersObjArray, msgId, accountI
     await safeEditMessageText(`✅ *VERIFIKASI SELESAI*\nTotal Pemindaian : ${total}\nNomor Terdaftar WA : *${activeCount}* data\n_(Via Akun ID: ${accountId})_`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 }
 
-// 🛠 REVISI: Nomor yang sudah dipakai (ada di used_numbers) tidak akan diberikan lagi
 async function assignRandomNumberToUser(userChatId) {
     const existing = await dbGet('SELECT number, range_name FROM user_assigned_numbers WHERE user_chat_id = ?', [userChatId]);
     if (existing) return existing; 
@@ -394,7 +388,6 @@ async function checkOtpForNumber(number, rangeName) {
     const todayStr = getTodayUTC();
     try {
         const messages = await acc.getMessages(number, rangeName, todayStr);
-        // REVISI: Ambil pesan indeks ke 0 (terbaru)
         if (messages && messages.length > 0) return messages[0]; 
     } catch (e) {}
     return null;
@@ -425,7 +418,6 @@ async function startOtpPolling(userChatId, number, rangeName, msgId) {
             if (!userStates[userChatId]) userStates[userChatId] = {};
             userStates[userChatId].lastSeenMsgId = currentMsgId;
             
-            // REVISI: Blokir permanen nomor yang sudah dapat OTP
             await dbRun(`INSERT OR REPLACE INTO used_numbers (number, user_chat_id) VALUES (?, ?)`, [number, userChatId]);
 
             const otpMatch = msg.text.match(/\b\d{4,8}\b/g); const otp = otpMatch ? otpMatch[0] : null;
@@ -453,7 +445,7 @@ async function startOtpPolling(userChatId, number, rangeName, msgId) {
     const timeoutId = setTimeout(poll, 5000); activeOtpPolling.set(userChatId, { timeoutId, msgId });
 }
 
-// ─── WORKER LAINNYA ────────────────────────────────────────────────────────
+// ─── WORKER (EKSTRAKSI MASSAL & POLLING BACKGROUND) ────────────────────────
 async function processBulkCheck(numbers, config, chatId, msgId) {
     let resPersonal = "=== WA PERSONAL ===\n\n";
     let resBisnis = "=== WA BISNIS ===\n\n";
@@ -535,8 +527,7 @@ async function pollAllAccounts() {
     } finally { setTimeout(pollAllAccounts, POLLING_INTERVAL); }
 }
 
-
-// ─── TELEGRAM ROUTER ───────────────────────────────────────────────────────
+// ─── TELEGRAM ROUTER (PERINTAH & CALLBACK) ─────────────────────────────────
 bot.onText(/\/(start|menu)/, async (msg) => {
     const chatId = msg.chat.id.toString();
     bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
@@ -574,7 +565,6 @@ bot.on('callback_query', async (query) => {
     if (action === 'user_get_number' || action === 'user_new_number') {
         if (action === 'user_new_number') { 
             const state = userStates[chatId];
-            // Blacklist nomor jika user membatalkannya tanpa mendapat OTP
             if (state?.assignedNumber) await dbRun(`INSERT OR IGNORE INTO used_numbers (number, user_chat_id) VALUES (?, ?)`, [state.assignedNumber, chatId]);
             stopOtpPolling(chatId); 
             await releaseNumberFromUser(chatId); 
@@ -853,6 +843,24 @@ bot.on('callback_query', async (query) => {
         userStates[chatId].state = 'IDLE'; 
         return safeEditMessageText("⚠️ *DIBATALKAN*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }); 
     }
+
+    // HANDLER UNTUK TOMBOL PROSES EKSTRAKSI FILE TXT
+    if (action.startsWith('start_')) {
+        if (!sock?.authState?.creds?.registered) return bot.answerCallbackQuery(query.id, { text: '⚠️ WhatsApp terputus!', show_alert: true });
+        
+        const parts = action.split('_'); 
+        const mode = parts[parts.length - 1]; 
+        const jobId = parts.slice(1, parts.length - 1).join('_');
+        const numbersList = jobQueue.get(jobId);
+        
+        if (!numbersList) return bot.answerCallbackQuery(query.id, { text: 'Data sudah kedaluwarsa, silakan unggah ulang TXT.', show_alert: true });
+
+        safeEditMessageText(`⏳ *MEMULAI EKSTRAKSI MASSAL*\n━━━━━━━━━━━━━━━━━━━━━━\n⚙️ Mode : *${mode.toUpperCase()}*\n📊 Total : *${numbersList.length}* Nomor`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        
+        processBulkCheck(numbersList, SPEED_MODES[mode], chatId, msgId);
+        jobQueue.delete(jobId);
+        return;
+    }
 });
 
 bot.on('message', async (msg) => {
@@ -928,6 +936,54 @@ bot.on('message', async (msg) => {
         if (phoneNumber.length < 8) return safeEditMessageText("❌ *FORMAT SALAH*", { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         await safeEditMessageText(`⏳ Menyiapkan WA untuk \`${phoneNumber}\`...`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown' });
         startWA(phoneNumber, chatId, menuMsgId);
+    }
+});
+
+// ─── HANDLER EKSTRAKSI DATA MASSAL (UPLOAD FILE TXT) ───────────────────────
+bot.on('document', async (msg) => {
+    const chatId = msg.chat.id.toString();
+    if (!isAdmin(chatId)) return;
+    
+    bot.deleteMessage(chatId, msg.message_id).catch(()=>{});
+    
+    if (!sock?.authState?.creds?.registered) {
+        const sm = await bot.sendMessage(chatId, '⚠️ *WA TERPUTUS*\nSilakan hubungkan WhatsApp Meta terlebih dahulu.', { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+        return;
+    }
+    
+    if (!msg.document.file_name.endsWith('.txt')) {
+        const sm = await bot.sendMessage(chatId, '❌ *FORMAT DITOLAK*\nSistem hanya menerima berkas berekstensi .txt', { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+        return;
+    }
+    
+    try {
+        const fileLink = await bot.getFileLink(msg.document.file_id);
+        const res = await axios.get(fileLink);
+        let rawNumbers = res.data.split('\n').map(n => n.replace(/\D/g, '')).filter(n => n.length > 8);
+        const uniqueNumbers = [...new Set(rawNumbers.map(n => n.startsWith('0') ? '62' + n.slice(1) : n))];
+        
+        if (uniqueNumbers.length === 0) {
+            const sm = await bot.sendMessage(chatId, '❌ *DATA KOSONG*\nTidak ada nomor valid untuk diekstrak.', { parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+            if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+            return;
+        }
+        
+        const jobId = Date.now().toString(); 
+        jobQueue.set(jobId, uniqueNumbers);
+        const sm = await bot.sendMessage(chatId, `📁 *BERKAS DITERIMA*\n━━━━━━━━━━━━━━━━━━━━━━\n*${uniqueNumbers.length}* nomor siap diproses.\n\nPilih mode kecepatan (Throttle):`, { 
+            parse_mode: 'Markdown', 
+            reply_markup: { inline_keyboard: [ 
+                [{ text: '🚀 Turbo (Agresif)', callback_data: `start_${jobId}_fast` }],
+                [{ text: '🚗 Bawaan (Seimbang)', callback_data: `start_${jobId}_normal` }],
+                [{ text: '🚲 Siluman (Aman)', callback_data: `start_${jobId}_slow` }] 
+            ]} 
+        });
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
+    } catch (e) { 
+        const sm = await bot.sendMessage(chatId, `❌ *GAGAL MEMBACA BERKAS*: ${e.message}`, { reply_markup: getMainMenuMarkup() }); 
+        if(userStates[chatId]) userStates[chatId].lastMsgId = sm.message_id;
     }
 });
 
