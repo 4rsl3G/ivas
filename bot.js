@@ -88,11 +88,11 @@ async function checkForceSub(chatId) {
 }
 
 async function sendForceSubMessage(chatId, msgId = null) {
-    const text = `🚫 *AKSES DITOLAK*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nLayanan *Bot OTP* mewajibkan Anda untuk bergabung dengan Kanal Resmi kami terlebih dahulu.\n\n👇 _Silakan bergabung melalui tautan di bawah, lalu klik tombol Verifikasi:_`;
+    const text = `🚫 *AKSES DITOLAK*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nLayanan *Bot OTP* mewajibkan Anda untuk bergabung dengan Channel Resmi kami terlebih dahulu.\n\n👇 _Silakan bergabung melalui tautan di bawah, lalu klik tombol Verifikasi:_`;
     const markup = {
         inline_keyboard: [
-            [{ text: '🔗 Bergabung ke Kanal Resmi', url: REQUIRED_CHANNEL_LINK }],
-            [{ text: '✅ Verifikasi Akses Saya', callback_data: 'check_join' }]
+            [{ text: '🔗 Bergabung ke Channel Resmi', url: REQUIRED_CHANNEL_LINK }],
+            [{ text: '✅ Sudah Join, callback_data: 'check_join' }]
         ]
     };
     if (msgId) await safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: markup });
