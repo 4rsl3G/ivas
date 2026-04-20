@@ -92,7 +92,7 @@ async function sendForceSubMessage(chatId, msgId = null) {
     const markup = {
         inline_keyboard: [
             [{ text: '🔗 Bergabung ke Channel Resmi', url: REQUIRED_CHANNEL_LINK }],
-            [{ text: '✅ Sudah Join, callback_data: 'check_join' }]
+            [{ text: '✅ Sudah Join', callback_data: 'check_join' }]
         ]
     };
     if (msgId) await safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: markup });
