@@ -57,7 +57,6 @@ const dbGet = (sql, params = []) => new Promise((res, rej) => sqlDb.get(sql, par
 const dbAll = (sql, params = []) => new Promise((res, rej) => sqlDb.all(sql, params, (err, rows) => err ? rej(err) : res(rows)));
 
 sqlDb.serialize(() => {
-    // Mempertahankan nama kolom 'cookies' agar tidak merusak DB lama, namun isinya diinjeksi JSON Full Headers
     dbRun(`CREATE TABLE IF NOT EXISTS ivas_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, cookies TEXT, label TEXT DEFAULT '', added_at TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS wa_nodes (number TEXT PRIMARY KEY, account_id INTEGER, range_name TEXT)`);
     dbRun(`CREATE TABLE IF NOT EXISTS seen_ids (msg_id TEXT PRIMARY KEY, account_id INTEGER)`);
@@ -156,7 +155,7 @@ async function safeEditMessageText(text, options) {
 class IVASAccount {
     constructor(accountId, headersObj) {
         this.accountId = accountId;
-        this.headers = headersObj; // Berisi JSON Full Headers asli
+        this.headers = headersObj;
         this.loggedIn = false;
         this.csrfToken = null;
         this.ja3 = '771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513,29-23-24,0';
@@ -166,7 +165,6 @@ class IVASAccount {
         if (!cycleTlsInstance) cycleTlsInstance = await initCycleTLS();
         const url = endpoint.startsWith('http') ? endpoint : `https://www.ivasms.com${endpoint}`;
         
-        // Membaca User-Agent dari headers yang diinput user, fallback ke default
         const userAgent = this.headers['User-Agent'] || this.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
         const reqHeaders = { ...this.headers, ...options.headers };
 
@@ -179,7 +177,6 @@ class IVASAccount {
             body: options.body
         });
 
-        // Simulasi perilaku axios untuk mengurai JSON secara otomatis
         if (res.body && typeof res.body === 'string') {
             try { res.data = JSON.parse(res.body); } 
             catch (e) { res.data = res.body; }
@@ -209,6 +206,84 @@ class IVASAccount {
             if (res.status === 200 && res.data?.data) return res.data.data.map(item => ({ number: item.Number.toString(), range: item.range }));
             return [];
         } catch (e) { return []; }
+    }
+
+    // ─── RADAR AUTO-BUYER METHODS ───
+    async scanActiveRanges(targetCount = 10) {
+        const uniqueRanges = new Set();
+        let start = 0; let page = 1;
+        const MAX_PAGES = 30;
+        const EXCLUDE_RANGES = ['INDONESIA', 'MALAYSIA'];
+
+        while (uniqueRanges.size < targetCount && page <= MAX_PAGES) {
+            const params = new URLSearchParams({
+                'draw': page.toString(),
+                'columns[0][data]': 'range',
+                'columns[2][data]': 'originator',
+                'columns[2][searchable]': 'true', 
+                'order[0][column]': '0',
+                'order[0][dir]': 'asc',
+                'start': start.toString(),
+                'length': '50',
+                'search[value]': 'WhatsApp', 
+                '_': Date.now().toString()
+            });
+
+            try {
+                const res = await this.request(`/portal/sms/test/sms?${params.toString()}`);
+                
+                if (res.status === 200 && res.data?.data) {
+                    if (res.data.data.length === 0) break;
+                    
+                    for (const row of res.data.data) {
+                        const sender = (row.originator || '').toLowerCase();
+                        const range = (row.range || '').toUpperCase();
+                        const isExcluded = EXCLUDE_RANGES.some(ex => range.includes(ex));
+                        
+                        if (sender.includes('whatsapp') && !isExcluded && range !== '') {
+                            uniqueRanges.add(range);
+                        }
+                    }
+                } else {
+                    break;
+                }
+                
+                if (uniqueRanges.size >= targetCount) break;
+                start += 50; page++;
+                await delay(1000); 
+            } catch (e) { break; }
+        }
+        return Array.from(uniqueRanges).slice(0, targetCount);
+    }
+
+    async getFirstNumberFromRange(rangeName) {
+        try {
+            const params = new URLSearchParams({
+                'draw': '1', 
+                'columns[0][data]': 'range',
+                'columns[0][search][value]': rangeName,
+                'columns[1][data]': 'test_number',
+                'order[0][column]': '8', 
+                'order[0][dir]': 'desc',
+                'start': '0', 
+                'length': '10', 
+                '_': Date.now().toString()
+            });
+            const res = await this.request(`/portal/numbers/test?${params.toString()}`);
+            
+            if (res.status === 200 && res.data?.data?.length > 0) {
+                const row = res.data.data[0];
+                const $ = cheerio.load(row.test_number);
+                const cleanNumber = $.text().trim() || row.test_number;
+                
+                return { 
+                    id: row.id || row.DT_RowId?.replace('row_', ''), 
+                    number: cleanNumber, 
+                    range: rangeName 
+                };
+            }
+            return null;
+        } catch (e) { return null; }
     }
 
     async fetchLiveTestSMS() {
@@ -474,7 +549,7 @@ function stopOtpPolling(userChatId) {
 
 async function startOtpPolling(userChatId, number, rangeName, msgId) {
     stopOtpPolling(userChatId);
-    let attempts = 0; const MAX_ATTEMPTS = 15; // 15 x 20 detik = 5 menit maksimal pencarian
+    let attempts = 0; const MAX_ATTEMPTS = 15;
     const lastSeenId = userStates[userChatId]?.lastSeenMsgId;
 
     const poll = async () => {
@@ -645,7 +720,6 @@ bot.on('callback_query', async (query) => {
 
     bot.answerCallbackQuery(query.id);
 
-    // ── Force Sub Check ──
     if (action === 'check_join') {
         if (await checkForceSub(chatId)) {
             return safeEditMessageText(`🔥 *LAYANAN FIX MERAH* 🔥\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nVerifikasi berhasil. Silakan ambil nomor WhatsApp Anda.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: isAdmin(chatId) ? getMainMenuMarkup() : getUserMenuMarkup() });
@@ -660,7 +734,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali ke Menu Utama', callback_data: 'cmd_cancel' }]] } });
     }
 
-    // ── USER ACTIONS ──
     if (action === 'user_get_number' || action === 'user_new_number') {
         if (action === 'user_new_number') { 
             const state = userStates[chatId];
@@ -854,7 +927,7 @@ bot.on('callback_query', async (query) => {
 
     if (action === 'cmd_stop_sniper') {
         if (userStates[chatId]) userStates[chatId].isSniperRunning = false;
-        return bot.answerCallbackQuery(query.id, { text: '🛑 Meminta sistem untuk menghentikan sniper...', show_alert: true });
+        return bot.answerCallbackQuery(query.id, { text: '🛑 Meminta sistem untuk menghentikan radar...', show_alert: true });
     }
 
     if (action === 'cmd_hunt_wa') {
@@ -862,104 +935,72 @@ bot.on('callback_query', async (query) => {
         if (activeAccs.length === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 
         userStates[chatId].isSniperRunning = true; 
+        const sniperMarkup = { inline_keyboard: [[{ text: '🛑 Batalkan Radar', callback_data: 'cmd_stop_sniper' }]] };
 
-        const MAX_BUY = 10; const maxRetries = 100; 
-        const sniperMarkup = { inline_keyboard: [[{ text: '🛑 Hentikan Sniper', callback_data: 'cmd_stop_sniper' }]] };
+        await safeEditMessageText(`🎯 *MESIN RADAR AUTO-BUYER AKTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nMemindai server untuk mencari 10 Range WhatsApp terbaik...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup });
 
-        await safeEditMessageText(`🎯 *MESIN AUTO-SNIPER WA AKTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nMencari nomor WhatsApp pada *${activeAccs.length}* Akun API.\nTarget: ${MAX_BUY} Nomor WA...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup });
+        // Gunakan akun aktif pertama sebagai eksekutor
+        const accId = activeAccs[0][0];
+        const watcherAcc = activeAccs[0][1]; 
 
-        const globalUniqueRanges = new Set(); const purchasedRanges = [];
-        let currentAccIndex = 0;
+        // -- TAHAP 1: Kumpulkan 10 Range --
+        const targetRanges = await watcherAcc.scanActiveRanges(10);
+        
+        if (targetRanges.length === 0) {
+            userStates[chatId].isSniperRunning = false;
+            return safeEditMessageText(`❌ *RADAR GAGAL*\nTidak ditemukan traffic WhatsApp di luar ID/MY saat ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
 
-        const watcherEntry = activeAccs.find(([, acc]) => acc.loggedIn);
-        if (!watcherEntry) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        const watcherAcc = watcherEntry[1];
+        let purchasedCount = 0;
+        let logText = `🎯 *RADAR SELESAI* (${targetRanges.length} Range)\nMemulai eksekusi pembelian beruntun...\n\n`;
+        await safeEditMessageText(logText, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup });
 
-        for (let i = 1; i <= maxRetries; i++) {
+        // -- TAHAP 2: Eksekusi Beli 1 per 1 Range --
+        const newNumbers = [];
+        for (let i = 0; i < targetRanges.length; i++) {
             if (!userStates[chatId].isSniperRunning) {
-                await safeEditMessageText(`🛑 *SNIPER DIHENTIKAN MANUAL*\nAuto-sniper dibatalkan oleh admin pada iterasi ke-${i}.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+                logText += `\n🛑 _Dihentikan oleh Admin_`;
                 break;
             }
-
-            if (i % 5 === 0 || i === 1) {
-                await safeEditMessageText(
-                    `🎯 *AUTO-SNIPER WA BERJALAN*\nIterasi: ${i}/${maxRetries}\nBerhasil Dibeli: ${purchasedRanges.length}/${MAX_BUY} Nomor\nAkun API Dipakai: ${activeAccs.length}`, 
-                    { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }
-                ).catch(()=>{});
-            }
-
-            const data = await watcherAcc.fetchLiveTestSMS();
             
-            for (const item of data) {
-                if (!userStates[chatId].isSniperRunning) break;
+            const range = targetRanges[i];
+            logText += `[${i+1}] \`${range}\` -> `;
+            await safeEditMessageText(logText + `_Memeriksa stok..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
 
-                let sender = '';
-                try {
-                    const $orig = cheerio.load(item.originator);
-                    sender = $orig('p').text().trim().toLowerCase();
-                } catch(e) { sender = String(item.originator || '').toLowerCase(); }
-                const messageData = String(item.messagedata || '').toLowerCase();
-                
-                const isWAMessage = sender.includes('whatsapp') || sender.includes('wa') || messageData.includes('whatsapp') || messageData.includes('wa code') || messageData.includes('code') || messageData.includes('kode');
+            // Ambil 1 ID stok dari range
+            const numData = await watcherAcc.getFirstNumberFromRange(range);
+            
+            if (!numData || !numData.id) {
+                logText += `❌ Stok Kosong\n`;
+            } else {
+                // Eksekusi Beli Langsung
+                const buyResult = await watcherAcc.addNumber(numData.id);
+                const resMsg = buyResult?.message?.toLowerCase() || '';
 
-                if (isWAMessage && !globalUniqueRanges.has(item.range)) {
-                    globalUniqueRanges.add(item.range);
-                    const [buyerId, buyerAcc] = activeAccs[currentAccIndex % activeAccs.length];
-                    
-                    await safeEditMessageText(`🎯 *TARGET TERKUNCI!*\nNegara: \`${item.range}\`\nMengeksekusi via Akun ID: \`${buyerId}\`...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
-
-                    const availableNums = await buyerAcc.getTestNumbersByRange(item.range);
-                    
-                    if (availableNums.length > 0) {
-                        const buyResult = await buyerAcc.addNumber(availableNums[0].id);
-                        if (buyResult && buyResult.message) {
-                            const resStr = buyResult.message.toLowerCase();
-                            if (resStr.includes('done') || resStr.includes('success') || resStr.includes('berhasil') || resStr.includes('added')) {
-                                purchasedRanges.push({ range: item.range, rate: availableNums[0].rate, accountId: buyerId });
-                                currentAccIndex++; 
-                                await safeEditMessageText(`✅ *NOMOR WA DIBELI!*\nNegara: \`${item.range}\`\nAkun: \`${buyerId}\`\nTotal: ${purchasedRanges.length}/${MAX_BUY}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
-                                await delay(1000);
-                            } else {
-                                await safeEditMessageText(`⚠️ *AKUN ${buyerId} GAGAL*\nAlasan: ${buyResult.message}\nMencoba akun berikutnya...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
-                                currentAccIndex++;
-                                globalUniqueRanges.delete(item.range);
-                                await delay(1500);
-                            }
-                        }
-                    } else {
-                        await safeEditMessageText(`⚠️ *KALAH CEPAT*\nStok \`${item.range}\` sudah habis.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
-                        await delay(1000);
-                    }
-                    if (purchasedRanges.length >= MAX_BUY) break; 
+                if (resMsg.includes('done') || resMsg.includes('success') || resMsg.includes('berhasil')) {
+                    logText += `✅ Sukses (+${numData.number})\n`;
+                    purchasedCount++;
+                    newNumbers.push({ number: numData.number, range: range });
+                } else {
+                    logText += `❌ Limit/Gagal\n`;
                 }
             }
-            if (purchasedRanges.length >= MAX_BUY) break;
-            if (i < maxRetries && userStates[chatId].isSniperRunning) await delay(3000); 
+            
+            await safeEditMessageText(logText, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
+            await delay(2000); 
         }
 
         userStates[chatId].isSniperRunning = false;
 
-        if (purchasedRanges.length > 0) {
-            let reply = `✅ *AUTO-SNIPER SELESAI*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nBerhasil memborong ${purchasedRanges.length} Nomor WA:\n\n`;
-            purchasedRanges.forEach((d, i) => { reply += `${i+1}. 🌍 *${d.range}* (Akun: \`${d.accountId}\`)\n   └ 💵 $${d.rate}\n\n`; });
-            await safeEditMessageText(reply + `⏳ _Sinkronisasi & Penyaringan Meta WA..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        // -- TAHAP 3: Validasi Filter WA Meta --
+        if (purchasedCount > 0) {
+            logText += `\n✅ *BERHASIL MEMBELI ${purchasedCount} NOMOR*\n⏳ _Melempar nomor ke filter Baileys WhatsApp..._`;
+            await safeEditMessageText(logText, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
-            const successfulAccIds = [...new Set(purchasedRanges.map(p => p.accountId))];
-            for (const accId of successfulAccIds) {
-                const acc = activeSessions.get(accId);
-                if (!acc) continue;
-                const existingNums = await dbAll('SELECT number FROM wa_nodes WHERE account_id = ?', [accId]);
-                const existingSet = new Set(existingNums.map(n => n.number));
-                const allMyNumbers = await acc.getMyNumbers();
-                const newNumbers = allMyNumbers.filter(n => !existingSet.has(n.number));
-                if (newNumbers.length > 0) {
-                    await delay(1000);
-                    await autoFilterAndSaveNumbers(chatId, newNumbers, msgId, accId);
-                }
-            }
-            safeEditMessageText(reply + `*🔥 PANEL ADMIN FIX MERAH*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }).catch(()=>{});
+            // Melempar array hasil beli langsung ke fungsi filter WA bawaan bot
+            await autoFilterAndSaveNumbers(chatId, newNumbers, msgId, accId);
         } else {
-            safeEditMessageText(`❌ *AUTO-SNIPER BERHENTI*\nTidak ada nomor baru yang berhasil diamankan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+            safeEditMessageText(logText + `\n❌ *TIDAK ADA NOMOR YANG TERBELI*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         }
         return;
     }
@@ -1090,7 +1131,6 @@ bot.on('message', async (msg) => {
         try {
             const headersObj = JSON.parse(text);
             const label = userStates[chatId].tempLabel || `Akun ${Date.now()}`;
-            // Memasukkan raw JSON string dari full headers ke dalam tabel DB 
             const res = await dbRun('INSERT INTO ivas_accounts (cookies, label, added_at) VALUES (?, ?, ?)', [JSON.stringify(headersObj), label, new Date().toISOString()]);
             const accountId = res.lastID;
             
@@ -1230,7 +1270,6 @@ bot.on('document', async (msg) => {
     let loadedCount = 0;
     for (const accData of accounts) {
         try {
-            // Memparsing JSON Full Headers yang disimpan di kolom cookies
             const headersObj = JSON.parse(accData.cookies);
             const account = new IVASAccount(accData.id, headersObj);
             if (await account.initSession()) {
