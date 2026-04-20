@@ -5,7 +5,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const pino = require('pino');
 const sqlite3 = require('sqlite3').verbose();
-const { io } = require('socket.io-client'); // IMPORT SOCKET.IO CLIENT
+const { io } = require('socket.io-client'); // Library untuk koneksi WSS IVASMS
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -152,7 +152,7 @@ async function safeEditMessageText(text, options) {
     catch (e) { if (!e.message.includes('message is not modified')) console.error('[safeEdit Error]', e.message); }
 }
 
-// ─── CORE: KELAS IVAS ACCOUNT (WSS ENABLED) ────────────────────────────────
+// ─── CORE: KELAS IVAS ACCOUNT DENGAN WSS SOCKET.IO ────────────────────────
 class IVASAccount {
     constructor(accountId, cookieString) {
         this.accountId = accountId;
@@ -170,7 +170,7 @@ class IVASAccount {
         this.loggedIn = false;
         this.csrfToken = null; 
         
-        // Atribut Socket.IO
+        // Atribut Socket.IO WSS Real-Time
         this.liveSocket = null;
         this.socketMessages = []; // Memori RAM Cache untuk SMS
     }
@@ -201,7 +201,7 @@ class IVASAccount {
                     this.csrfToken = csrfInput.val(); 
                     this.loggedIn = true; 
                     
-                    // Inisialisasi Socket.IO secara asinkron setelah berhasil login
+                    // Bangun koneksi WebSocket WSS secara background
                     this.connectLiveSocket();
                     
                     return true; 
@@ -211,24 +211,31 @@ class IVASAccount {
         } catch (e) { return false; }
     }
 
-    // ─── FUNGSI KONEKSI SOCKET.IO (WSS) ───
+    // ==========================================
+    // MESIN SOCKET.IO REALTIME WSS IVASMS
+    // ==========================================
     async connectLiveSocket() {
         try {
-            // 1. Fetch halaman untuk mendapatkan dynamic query token, user, dan event name
+            // Scrape halaman untuk mendapatkan param dinamis (Token, User, Event Name)
             const res = await this.client.get('/portal/sms/test/sms', { headers: this.getBaseHeaders() });
             const html = res.data;
             
+            // Pola ekstraksi sesuai dengan skrip window.liveSMSSocket di web
             const urlMatch = html.match(/io\.connect\(\s*['"](https:\/\/[^'"]+)['"]/);
             const tokenMatch = html.match(/token:\s*['"]([^'"]+)['"]/);
             const userMatch = html.match(/user:\s*['"]([^'"]+)['"]/);
-            const eventMatch = html.match(/\.on\(\s*['"]([^'"]+)['"]/);
+            const eventMatch = html.match(/\.on\(\s*['"](eyJ[^'"]+)['"]/);
 
             if (tokenMatch && userMatch && eventMatch) {
                 const wssUrl = urlMatch ? urlMatch[1] : 'https://ivasms.com:2087/livesms';
                 const eventName = eventMatch[1];
-                
+
+                // Inisialisasi koneksi Socket.IO (EIO=4 transport websocket)
                 this.liveSocket = io(wssUrl, {
-                    query: { token: tokenMatch[1], user: userMatch[1] },
+                    query: { 
+                        token: tokenMatch[1], 
+                        user: userMatch[1] 
+                    },
                     transports: ['websocket'],
                     secure: true,
                     reconnection: true,
@@ -242,12 +249,12 @@ class IVASAccount {
                 });
 
                 this.liveSocket.on('connect', () => {
-                    console.log(`[WSS] Akun ID ${this.accountId} TERHUBUNG ke Live Socket! Memantau OTP instan...`);
+                    console.log(`[WSS] Akun ID ${this.accountId} TERHUBUNG ke Live WSS IVASMS! Siap memantau OTP.`);
                 });
 
+                // Mendengarkan pesan dari event rahasia IVASMS
                 this.liveSocket.on(eventName, (data) => {
-                    if(data && data.recipient) {
-                        // Bersihkan tag HTML jika ada
+                    if (data && data.recipient) {
                         const $ = cheerio.load(data.originator || '');
                         const sender = $.text().trim() || data.originator || '';
                         
@@ -259,23 +266,33 @@ class IVASAccount {
                             countryRange: data.range || data.country_iso
                         };
                         
-                        // Simpan ke Cache RAM
+                        // Push pesan ke RAM Cache Lokal
                         this.socketMessages.push(msgObj);
                         
-                        // Proteksi Memori: Simpan max 1000 log SMS terakhir
-                        if (this.socketMessages.length > 1000) this.socketMessages.shift();
+                        // Proteksi Limit Memori RAM (Max 1500 pesan terakhir)
+                        if (this.socketMessages.length > 1500) this.socketMessages.shift();
                     }
                 });
 
-                this.liveSocket.on('disconnect', () => console.log(`[WSS] Akun ID ${this.accountId} Socket terputus.`));
+                this.liveSocket.on('connect_error', (err) => {
+                    console.log(`[WSS] Akun ID ${this.accountId} Gagal menyambung socket:`, err.message);
+                });
+                
+                this.liveSocket.on('disconnect', () => {
+                    console.log(`[WSS] Akun ID ${this.accountId} Koneksi socket terputus.`);
+                });
+
             } else {
-                console.log(`[WSS] Parameter Socket gagal di-ekstrak pada Akun ID ${this.accountId}.`);
+                console.log(`[WSS] Gagal ekstrak parameter dari HTML untuk Akun ID ${this.accountId}.`);
             }
         } catch (e) {
             console.log(`[WSS] Error inisialisasi socket Akun ${this.accountId}:`, e.message);
         }
     }
 
+    // ==========================================
+    // TAHAP 1: RADAR (Kumpulkan Range Aktif)
+    // ==========================================
     async scanActiveRanges(targetCount = 10) {
         let uniqueRanges = new Set(); 
         let start = 0; 
@@ -286,9 +303,16 @@ class IVASAccount {
 
         while (uniqueRanges.size < targetCount && page <= MAX_PAGES) {
             const params = new URLSearchParams({
-                'draw': page.toString(), 'columns[0][data]': 'range', 'columns[2][data]': 'originator',
-                'columns[2][searchable]': 'true', 'order[0][column]': '0', 'order[0][dir]': 'asc',
-                'start': start.toString(), 'length': '50', 'search[value]': TARGET_SID, '_': Date.now().toString()
+                'draw': page.toString(),
+                'columns[0][data]': 'range',
+                'columns[2][data]': 'originator',
+                'columns[2][searchable]': 'true', 
+                'order[0][column]': '0',
+                'order[0][dir]': 'asc',
+                'start': start.toString(),
+                'length': '50', 
+                'search[value]': TARGET_SID, 
+                '_': Date.now().toString()
             });
 
             try {
@@ -298,24 +322,35 @@ class IVASAccount {
                 
                 if (res.status === 200 && res.data?.data) {
                     if (res.data.data.length === 0) break; 
+                    
                     for (const row of res.data.data) {
                         const $ = cheerio.load(row.originator || '');
                         const sender = $.text().trim().toLowerCase() || (row.originator || '').toLowerCase();
                         const range = (row.range || '').toUpperCase();
                         const isExcluded = EXCLUDE_RANGES.some(ex => range.includes(ex));
+                        
                         if (sender.includes(TARGET_SID.toLowerCase()) && !isExcluded && range !== '') {
                             uniqueRanges.add(range);
                         }
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
                 
                 if (uniqueRanges.size >= targetCount) break;
-                start += 50; page++; await delay(1000); 
-            } catch (error) { break; }
+                start += 50; 
+                page++;
+                await delay(1000); 
+            } catch (error) {
+                break; 
+            }
         }
         return Array.from(uniqueRanges).slice(0, targetCount);
     }
 
+    // ==========================================
+    // TAHAP 2: Ambil Semua Stok dari Range
+    // ==========================================
     async getTestNumbersByRange(rangeName) {
         try {
             const params = new URLSearchParams({
@@ -329,11 +364,39 @@ class IVASAccount {
                 return res.data.data.map(item => {
                     const $ = cheerio.load(item.test_number || '');
                     const cleanNumber = $.text().trim() || item.test_number;
-                    return { id: item.id || item.DT_RowId?.replace('row_', ''), number: cleanNumber, rate: item.A2P };
+                    return { 
+                        id: item.id || item.DT_RowId?.replace('row_', ''), 
+                        number: cleanNumber, 
+                        rate: item.A2P 
+                    };
                 });
             }
             return [];
         } catch (e) { return []; }
+    }
+
+    async getFirstNumberFromRange(rangeName) {
+        try {
+            const params = new URLSearchParams({
+                'draw': '1', 'columns[0][data]': 'range', 'columns[0][search][value]': rangeName,
+                'columns[1][data]': 'test_number', 'columns[8][data]': 'action',
+                'order[0][column]': '8', 'order[0][dir]': 'desc', 'start': '0', 'length': '10', '_': Date.now().toString()
+            });
+
+            const res = await this.client.get(`/portal/numbers/test?${params.toString()}`, { headers: { ...this.getBaseHeaders(), "referer": "https://www.ivasms.com/portal/numbers/test" }});
+            
+            if (res.status === 200 && res.data?.data && res.data.data.length > 0) {
+                const firstRow = res.data.data[0];
+                const $ = cheerio.load(firstRow.test_number || '');
+                const cleanNumber = $.text().trim() || firstRow.test_number;
+                return {
+                    id: firstRow.id || firstRow.DT_RowId?.replace('row_', ''),
+                    number: cleanNumber,
+                    rate: firstRow.A2P
+                };
+            }
+            return null;
+        } catch (error) { return null; }
     }
 
     async getMyNumbers() {
@@ -345,16 +408,18 @@ class IVASAccount {
         } catch (e) { return []; }
     }
 
-    // DIMODIFIKASI: Memprioritaskan RAM Cache WSS sebelum menembak API HTTP
+    // ==========================================
+    // GET MESSAGES (Diperkuat WSS RAM Cache)
+    // ==========================================
     async getMessages(phoneNumber, countryRange, dateStr) {
-        // 1. Cek secara instan di Memori RAM Socket.IO
+        // 1. Cek instan di Cache RAM dari WebSocket
         if (this.socketMessages && this.socketMessages.length > 0) {
             const matched = this.socketMessages.filter(m => m.phoneNumber.includes(phoneNumber));
-            // Return reverse agar pesan terbaru berada di urutan [0]
+            // Return reverse agar pesan terbaru berada di urutan teratas
             if (matched.length > 0) return matched.reverse(); 
         }
 
-        // 2. Fallback: Jika di RAM tidak ada, ambil paksa dari server (HTTP)
+        // 2. Fallback jika tidak ada di RAM: Ambil dari API HTTP
         try {
             const payload = new URLSearchParams({ '_token': this.csrfToken, 'start': dateStr, 'end': dateStr, 'Number': phoneNumber, 'Range': countryRange });
             const res = await this.client.post('/portal/sms/received/getsms/number/sms', payload.toString(), { 
@@ -374,7 +439,7 @@ class IVASAccount {
 
     async getTerminationDetails(id) {
         try {
-            const payload = newSearchParams({ 'id': id, '_token': this.csrfToken });
+            const payload = new URLSearchParams({ 'id': id, '_token': this.csrfToken });
             const res = await this.client.post('/portal/numbers/termination/details', payload.toString(), { headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } });
             if (res.status === 200 && res.data) {
                 const $ = cheerio.load(res.data);
@@ -583,7 +648,7 @@ async function checkOtpForNumber(number, rangeName) {
     return messages && messages.length > 0 ? messages[0] : null;
 }
 
-// ─── POLLING OTP PENGGUNA (CEK KE-1 & CEK KE-2) ────────────────────────────
+// ─── POLLING OTP PENGGUNA (CEK KE-1 & CEK KE-2 WSS ENABLED) ────────────────
 function stopOtpPolling(userChatId) {
     const existing = activeOtpPolling.get(userChatId);
     if (existing) { clearTimeout(existing.timeoutId); activeOtpPolling.delete(userChatId); }
@@ -591,24 +656,21 @@ function stopOtpPolling(userChatId) {
 
 async function startOtpPolling(userChatId, number, rangeName, msgId, isSecond = false) {
     stopOtpPolling(userChatId);
-    let attempts = 0; const MAX_ATTEMPTS = 40; // 40 * 3s = 2 Menit Pencarian
-    
-    // Jika mencari OTP kedua, kita kunci ID SMS yang pertama agar diabaikan
+    let attempts = 0; const MAX_ATTEMPTS = 60; // 60 * 2s = 2 Menit (Jeda poll kita cepatin karena ada RAM WSS)
     const lastSeenId = userStates[userChatId]?.lastSeenMsgId;
 
     const poll = async () => {
-        attempts++; const elapsed = attempts * 3;
+        attempts++; const elapsed = attempts * 2;
         const titleCode = isSecond ? "KODE OTP KE-2" : "KODE OTP WA";
         
         await safeEditMessageText(
-            `⏳ *MENUNGGU ${titleCode}...*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n📱 Nomor WA : \`+${number}\`\n🌍 Negara : ${rangeName}\n\n⏱ Memantau SMS: Ke-${attempts} (${elapsed} detik)...\n_Silakan klik 'Kirim Ulang SMS' pada aplikasi WhatsApp Anda._`, 
+            `⏳ *MENUNGGU ${titleCode}...*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n📱 Nomor WA : \`+${number}\`\n🌍 Negara : ${rangeName}\n\n⏱ Memantau SMS (Fast Socket): Ke-${attempts} (${elapsed} detik)...\n_Silakan klik 'Kirim Ulang SMS' pada aplikasi WhatsApp._`, 
             { chat_id: userChatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Batalkan Pencarian OTP', callback_data: 'user_cancel_otp' }]] } }
         ).catch(() => {});
 
         const msg = await checkOtpForNumber(number, rangeName);
         const currentMsgId = msg ? `${msg.time}_${msg.text}` : null;
         
-        // Match SMS: Pesan ada, dan ID pesan BEDA dari yang sebelumnya (Penting untuk OTP ke-2)
         if (msg && currentMsgId !== lastSeenId) {
             stopOtpPolling(userChatId);
             if (!userStates[userChatId]) userStates[userChatId] = {};
@@ -627,7 +689,6 @@ async function startOtpPolling(userChatId, number, rangeName, msgId, isSecond = 
             const inline_keyboard = [];
             if (otp) inline_keyboard.push([{ text: `🔑 ${otp}`, callback_data: 'dummy_btn' }]);
             
-            // Tambahkan Menu Resend / OTP Ke-2
             inline_keyboard.push([{ text: '📨 Cek OTP Selanjutnya (Resend)', callback_data: 'user_get_otp_2' }]);
             inline_keyboard.push([{ text: '🔄 Ambil Nomor WhatsApp Lain', callback_data: 'user_new_number' }]);
 
@@ -649,13 +710,10 @@ async function startOtpPolling(userChatId, number, rangeName, msgId, isSecond = 
             }).catch(() => {});
             return;
         }
-        
-        // Jeda polling diturunkan ke 3 detik agar respons Socket.IO terasa sangat instan
-        const timeoutId = setTimeout(poll, 3000); 
+        const timeoutId = setTimeout(poll, 2000); 
         activeOtpPolling.set(userChatId, { timeoutId, msgId });
     };
-    
-    const timeoutId = setTimeout(poll, 3000); 
+    const timeoutId = setTimeout(poll, 2000); 
     activeOtpPolling.set(userChatId, { timeoutId, msgId });
 }
 
@@ -742,7 +800,6 @@ async function pollAllAccounts() {
             }
         }
     } finally {
-        // Polling berjalan lebih lambat sebagai fallback, karena Socket.IO sudah menangani secara realtime
         setTimeout(pollAllAccounts, POLLING_INTERVAL);
     }
 }
@@ -1047,7 +1104,7 @@ bot.on('callback_query', async (query) => {
         });
     }
 
-    // ── AUTO-SNIPER ──
+    // ── AUTO-SNIPER DENGAN BORONG NOMOR ──
     if (action === 'cmd_hunt_wa') {
         const activeAccs = getActiveAccounts();
         if (activeAccs.length === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
