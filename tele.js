@@ -2,8 +2,6 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const axios = require('axios');
-const { wrapper } = require('axios-cookiejar-support');
-const { CookieJar, Cookie } = require('tough-cookie');
 const cheerio = require('cheerio');
 const pino = require('pino');
 const sqlite3 = require('sqlite3').verbose();
@@ -153,44 +151,118 @@ async function safeEditMessageText(text, options) {
     catch (e) { if (!e.message.includes('message is not modified')) console.error('[safeEdit Error]', e.message); }
 }
 
-// ─── CORE: KELAS IVAS ACCOUNT ──────────────────────────────────────────────
+// ─── CORE: KELAS IVAS ACCOUNT DENGAN GLOBAL HEADERS ────────────────────────
 class IVASAccount {
-    constructor(accountId, cookies) {
+    constructor(accountId, cookieString) {
         this.accountId = accountId;
-        this.cookies = cookies;
-        this.jar = new CookieJar();
-        this.client = wrapper(axios.create({
-            jar: this.jar, baseURL: 'https://www.ivasms.com', timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                'Sec-Fetch-Site': 'same-origin',
-                'X-Requested-With': 'XMLHttpRequest'
-            }
-        }));
+        this.cookieString = cookieString;
+        
+        const xsrfMatch = cookieString.match(/XSRF-TOKEN=([^;]+)/);
+        const rawXsrf = xsrfMatch ? xsrfMatch[1] : '';
+        this.headerCsrf = decodeURIComponent(rawXsrf);
+
+        this.client = axios.create({
+            baseURL: 'https://www.ivasms.com', 
+            timeout: 15000 
+        });
         this.loggedIn = false;
-        this.csrfToken = null;
+        this.csrfToken = null; 
+    }
+
+    getBaseHeaders() {
+        return {
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "accept-language": "en-US,en;q=0.9",
+            "cookie": this.cookieString,
+            "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": '"Android"',
+            "user-agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+            "x-csrf-token": this.headerCsrf,
+            "x-requested-with": "XMLHttpRequest"
+        };
     }
 
     async initSession() {
-        for (const [name, value] of Object.entries(this.cookies)) {
-            await this.jar.setCookie(new Cookie({ key: name, value: value, domain: 'www.ivasms.com' }).toString(), 'https://www.ivasms.com');
-        }
         try {
-            const res = await this.client.get('/portal/sms/received', { headers: { 'Accept': 'text/html' }});
+            const res = await this.client.get('/portal/sms/received', { 
+                headers: { ...this.getBaseHeaders(), 'Accept': 'text/html' }
+            });
             if (res.status === 200) {
                 const $ = cheerio.load(res.data);
                 const csrfInput = $('input[name="_token"]');
-                if (csrfInput.length) { this.csrfToken = csrfInput.val(); this.loggedIn = true; return true; }
+                if (csrfInput.length) { 
+                    this.csrfToken = csrfInput.val(); 
+                    this.loggedIn = true; 
+                    return true; 
+                }
             }
             return false;
         } catch (e) { return false; }
     }
 
+    // ==========================================
+    // TAHAP 1: RADAR (Kumpulkan Range Aktif)
+    // ==========================================
+    async scanActiveRanges(targetCount = 10) {
+        let uniqueRanges = new Set(); 
+        let start = 0; 
+        let page = 1;
+        const MAX_PAGES = 50; 
+        const TARGET_SID = 'WhatsApp';
+        const EXCLUDE_RANGES = ['INDONESIA', 'MALAYSIA'];
+
+        while (uniqueRanges.size < targetCount && page <= MAX_PAGES) {
+            const params = new URLSearchParams({
+                'draw': page.toString(),
+                'columns[0][data]': 'range',
+                'columns[2][data]': 'originator',
+                'columns[2][searchable]': 'true', 
+                'order[0][column]': '0',
+                'order[0][dir]': 'asc',
+                'start': start.toString(),
+                'length': '50', 
+                'search[value]': TARGET_SID, 
+                '_': Date.now().toString()
+            });
+
+            try {
+                const res = await this.client.get(`/portal/sms/test/sms?${params.toString()}`, { 
+                    headers: { ...this.getBaseHeaders(), "referer": "https://www.ivasms.com/portal/sms/test/sms" }
+                });
+                
+                if (res.status === 200 && res.data?.data) {
+                    if (res.data.data.length === 0) break; 
+                    
+                    for (const row of res.data.data) {
+                        const $ = cheerio.load(row.originator || '');
+                        const sender = $.text().trim().toLowerCase() || (row.originator || '').toLowerCase();
+                        const range = (row.range || '').toUpperCase();
+                        const isExcluded = EXCLUDE_RANGES.some(ex => range.includes(ex));
+                        
+                        if (sender.includes(TARGET_SID.toLowerCase()) && !isExcluded && range !== '') {
+                            uniqueRanges.add(range);
+                        }
+                    }
+                } else {
+                    break;
+                }
+                
+                if (uniqueRanges.size >= targetCount) break;
+                start += 50; 
+                page++;
+                await delay(1000); 
+            } catch (error) {
+                break; 
+            }
+        }
+        return Array.from(uniqueRanges).slice(0, targetCount);
+    }
+
     async getMyNumbers() {
         try {
             const params = new URLSearchParams({ draw: 1, start: 0, length: 2000, 'search[value]': '' });
-            const res = await this.client.get(`/portal/numbers?${params.toString()}`);
+            const res = await this.client.get(`/portal/numbers?${params.toString()}`, { headers: this.getBaseHeaders() });
             if (res.status === 200 && res.data?.data) return res.data.data.map(item => ({ number: item.Number.toString(), range: item.range }));
             return [];
         } catch (e) { return []; }
@@ -204,7 +276,7 @@ class IVASAccount {
                 'order[0][column]': '4', 'order[0][dir]': 'desc', 'start': '0', 'length': '50', 
                 'search[value]': '', '_': Date.now()
             });
-            const res = await this.client.get(`/portal/sms/test/sms?${params.toString()}`);
+            const res = await this.client.get(`/portal/sms/test/sms?${params.toString()}`, { headers: this.getBaseHeaders() });
             if (res.status === 200 && res.data?.data) return res.data.data;
             return [];
         } catch (e) { return []; }
@@ -218,8 +290,19 @@ class IVASAccount {
                 'columns[1][data]': 'test_number', 'columns[1][name]': 'terminations.test_number',
                 'start': '0', 'length': '25', 'search[value]': '', '_': Date.now()
             });
-            const res = await this.client.get(`/portal/numbers/test?${params.toString()}`);
-            if (res.status === 200 && res.data?.data) return res.data.data.map(item => ({ id: item.id, number: item.test_number, rate: item.A2P }));
+            const res = await this.client.get(`/portal/numbers/test?${params.toString()}`, { headers: this.getBaseHeaders() });
+            if (res.status === 200 && res.data?.data) {
+                return res.data.data.map(item => {
+                    // Bersihkan tag HTML dari kolom test_number
+                    const $ = cheerio.load(item.test_number || '');
+                    const cleanNumber = $.text().trim() || item.test_number;
+                    return { 
+                        id: item.id || item.DT_RowId?.replace('row_', ''), 
+                        number: cleanNumber, 
+                        rate: item.A2P 
+                    };
+                });
+            }
             return [];
         } catch (e) { return []; }
     }
@@ -227,7 +310,9 @@ class IVASAccount {
     async getTerminationDetails(id) {
         try {
             const payload = new URLSearchParams({ 'id': id, '_token': this.csrfToken });
-            const res = await this.client.post('/portal/numbers/termination/details', payload.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } });
+            const res = await this.client.post('/portal/numbers/termination/details', payload.toString(), { 
+                headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } 
+            });
             if (res.status === 200 && res.data) {
                 const $ = cheerio.load(res.data);
                 const rangeName = $('h5.mb-2').first().text().trim();
@@ -251,7 +336,9 @@ class IVASAccount {
     async addNumber(id) {
         try {
             const payload = new URLSearchParams({ '_token': this.csrfToken, 'id': id });
-            const res = await this.client.post('/portal/numbers/termination/number/add', payload.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } });
+            const res = await this.client.post('/portal/numbers/termination/number/add', payload.toString(), { 
+                headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } 
+            });
             if (res.status === 200 && res.data) return res.data;
             return null;
         } catch (e) { return null; }
@@ -260,7 +347,9 @@ class IVASAccount {
     async getCountries(dateStr) {
         try {
             const payload = new URLSearchParams({ 'from': dateStr, 'to': dateStr, '_token': this.csrfToken });
-            const res = await this.client.post('/portal/sms/received/getsms', payload.toString());
+            const res = await this.client.post('/portal/sms/received/getsms', payload.toString(), { 
+                headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } 
+            });
             if (res.status === 200) {
                 const $ = cheerio.load(res.data); const countries = []; 
                 $('div.rng').each((i, el) => countries.push($(el).find('.rname').text().trim()));
@@ -273,7 +362,9 @@ class IVASAccount {
     async getNumbers(countryRange, dateStr) {
         try {
             const payload = new URLSearchParams({ '_token': this.csrfToken, 'start': dateStr, 'end': dateStr, 'range': countryRange });
-            const res = await this.client.post('/portal/sms/received/getsms/number', payload.toString());
+            const res = await this.client.post('/portal/sms/received/getsms/number', payload.toString(), { 
+                headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } 
+            });
             if (res.status === 200) {
                 const numbers = []; const $ = cheerio.load(res.data);
                 $('div.nrow').each((i, el) => numbers.push($(el).find('.nnum').text().trim())); 
@@ -286,7 +377,9 @@ class IVASAccount {
     async getMessages(phoneNumber, countryRange, dateStr) {
         try {
             const payload = new URLSearchParams({ '_token': this.csrfToken, 'start': dateStr, 'end': dateStr, 'Number': phoneNumber, 'Range': countryRange });
-            const res = await this.client.post('/portal/sms/received/getsms/number/sms', payload.toString());
+            const res = await this.client.post('/portal/sms/received/getsms/number/sms', payload.toString(), { 
+                headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } 
+            });
             if (res.status === 200) {
                 const messages = []; const $ = cheerio.load(res.data);
                 $('tbody tr').each((i, el) => {
@@ -302,7 +395,9 @@ class IVASAccount {
     async returnAllNumbers() {
         try {
             const payload = new URLSearchParams({ '_token': this.csrfToken });
-            const res = await this.client.post('/portal/numbers/return/allnumber/bluck', payload.toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } });
+            const res = await this.client.post('/portal/numbers/return/allnumber/bluck', payload.toString(), { 
+                headers: { ...this.getBaseHeaders(), 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } 
+            });
             if (res.status === 200 && res.data) return res.data;
             return null;
         } catch (e) { return null; }
@@ -633,7 +728,6 @@ bot.on('callback_query', async (query) => {
 
     bot.answerCallbackQuery(query.id);
 
-    // ── Force Sub Check ──
     if (action === 'check_join') {
         if (await checkForceSub(chatId)) {
             return safeEditMessageText(`🔥 *LAYANAN BOT OTP* 🔥\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nVerifikasi berhasil. Silakan ambil nomor WhatsApp Anda.`, { 
@@ -646,7 +740,6 @@ bot.on('callback_query', async (query) => {
 
     if (!isAdmin(chatId) && !(await checkForceSub(chatId))) return sendForceSubMessage(chatId, msgId);
 
-    // ── Bantuan Bulk Check ──
     if (action === 'cmd_help_bulk') {
         const text = `📁 *PANDUAN EKSTRAKSI MASSAL (BULK CHECK TXT)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nSistem Bot OTP dapat memfilter WA Personal, Bisnis, dan Nomor Tidak Terdaftar secara massal.\n\n*Langkah-langkah:*\n1. Siapkan file \`.txt\` berisi daftar nomor (1 nomor per baris).\n2. *Kirim / Upload file tersebut langsung ke dalam chat bot ini.*\n3. Pilih kecepatan ekstraksi (Turbo/Normal/Siluman) yang muncul di layar.\n4. Tunggu hingga bot membalas dengan hasil pemisahan dokumen TXT.`;
         return safeEditMessageText(text, { 
@@ -655,7 +748,6 @@ bot.on('callback_query', async (query) => {
         });
     }
 
-    // ── USER ACTIONS ──
     if (action === 'user_get_number' || action === 'user_new_number') {
         if (action === 'user_new_number') { 
             const state = userStates[chatId];
@@ -719,11 +811,9 @@ bot.on('callback_query', async (query) => {
         });
     }
 
-    // ── ADMIN ONLY BELOW ──
     if (!isAdmin(chatId)) return;
     if (!userStates[chatId]) userStates[chatId] = { state: 'IDLE', lastMsgId: msgId };
 
-    // ── Lihat Daftar Pengguna ──
     if (action === 'cmd_manage_users') {
         const users = await dbAll('SELECT chat_id, username, added_at FROM whitelisted_users ORDER BY added_at DESC LIMIT 50');
         const countRow = await dbGet('SELECT COUNT(*) as count FROM whitelisted_users');
@@ -733,7 +823,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'cmd_cancel' }]] } });
     }
 
-    // ── List Akun API ──
     if (action === 'cmd_list_accounts') {
         const accounts = await dbAll('SELECT id, label, added_at FROM ivas_accounts ORDER BY id ASC');
         if (accounts.length === 0) return safeEditMessageText("❌ *BELUM ADA AKUN API*\nSilakan tambah akun API terlebih dahulu.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
@@ -771,7 +860,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(`✅ *AKUN API ID ${accId} DIHAPUS*\nSeluruh data nomor terkait juga telah dibersihkan.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
 
-    // ── Stok Aktif ──
     if (action === 'cmd_active_ranges') {
         const ranges = await dbAll('SELECT range_name, COUNT(*) as count FROM wa_nodes GROUP BY range_name ORDER BY count DESC');
         if (ranges.length === 0) return safeEditMessageText("⚠️ *STOK KOSONG*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
@@ -797,41 +885,11 @@ bot.on('callback_query', async (query) => {
         }
     }
 
-    // ── Login / Tambah Akun ──
     if (action === 'cmd_login') {
-        userStates[chatId].state = 'WAITING_COOKIE'; 
-        userStates[chatId].tempCookies = {};
-        userStates[chatId].tempLabel = '';
-        return safeEditMessageText("🔑 *TAMBAH AKUN API IVAS*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nInjeksi cookie dari website IVAS. Gunakan format:\n`nama=nilai`\n\nContoh: `ivas_sms_session=eyJp...`", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
+        userStates[chatId].state = 'WAITING_RAW_COOKIE'; 
+        return safeEditMessageText("🔑 *TAMBAH AKUN API IVAS*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nKirimkan teks *RAW COOKIES* dari request browser Anda.\n\nContoh:\n`cf_clearance=ivdHY...; XSRF-TOKEN=eyJp...; ivas_sms_session=eyJp...`", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
     } 
 
-    if (action === 'cmd_finish_login') {
-        const cookiesObj = userStates[chatId]?.tempCookies;
-        if (!cookiesObj || !cookiesObj['ivas_sms_session']) {
-            return safeEditMessageText("❌ *GAGAL*\nParameter `ivas_sms_session` wajib diisi.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
-        }
-        userStates[chatId].state = 'IDLE';
-        await safeEditMessageText("⏳ *MENYIMPAN AKUN API...*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-        const label = userStates[chatId].tempLabel || `Akun ${Date.now()}`;
-        const res = await dbRun('INSERT INTO ivas_accounts (cookies, label, added_at) VALUES (?, ?, ?)', [JSON.stringify(cookiesObj), label, new Date().toISOString()]);
-        const accountId = res.lastID;
-        const account = new IVASAccount(accountId, cookiesObj);
-        if (await account.initSession()) {
-            activeSessions.set(accountId, account);
-            const myNumbers = await account.getMyNumbers();
-            if (myNumbers.length > 0) {
-                await autoFilterAndSaveNumbers(chatId, myNumbers, msgId, accountId);
-            } else {
-                safeEditMessageText(`✅ *AKUN API BERHASIL DITAMBAHKAN*\nID Akun: \`${accountId}\` | Label: ${label}\nStok nomor bawaan: 0.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-            }
-        } else {
-            await dbRun('DELETE FROM ivas_accounts WHERE id = ?', [accountId]);
-            safeEditMessageText("❌ *GAGAL AUTENTIKASI*\nCookie salah atau telah expired. Akun tidak disimpan.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        }
-        return;
-    }
-
-    // ── Sinkronisasi Database (SEMUA AKUN) ──
     if (action === 'cmd_sync_db') {
         const activeAccs = getActiveAccounts();
         if (activeAccs.length === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
@@ -850,7 +908,6 @@ bot.on('callback_query', async (query) => {
         return;
     }
 
-    // ── Tampilkan Nomor WA (Pagination) ──
     if (action.startsWith('cmd_get_wa_numbers_')) {
         const offset = parseInt(action.replace('cmd_get_wa_numbers_', '')) || 0; 
         const limit = 3;
@@ -872,7 +929,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: { inline_keyboard } });
     }
 
-    // ── Cari Stok Negara ──
     if (action === 'cmd_search_range') {
         const activeAccs = getActiveAccounts();
         if (activeAccs.length === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
@@ -880,7 +936,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(`🛒 *CARI STOK BERDASARKAN NEGARA*\nKetikkan nama negara (misal: \`INDONESIA 232428\`).`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
     }
 
-    // ── Detail Terminasi ──
     if (action.startsWith('term_detail_')) {
         const parts = action.split('_'); 
         const termId = parts[2]; 
@@ -900,7 +955,6 @@ bot.on('callback_query', async (query) => {
         return;
     }
 
-    // ── Beli Nomor ──
     if (action.startsWith('add_term_')) {
         const parts = action.split('_'); 
         const termId = parts[2]; 
@@ -931,7 +985,7 @@ bot.on('callback_query', async (query) => {
     if (action === 'cmd_stop_sniper') {
         if (userStates[chatId]) userStates[chatId].isSniperRunning = false;
         return bot.answerCallbackQuery(query.id, { 
-            text: '🛑 Meminta sistem untuk menghentikan sniper...', 
+            text: '🛑 Meminta sistem untuk menghentikan radar...', 
             show_alert: true 
         });
     }
@@ -942,129 +996,77 @@ bot.on('callback_query', async (query) => {
         if (activeAccs.length === 0) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
 
         userStates[chatId].isSniperRunning = true; 
+        const sniperMarkup = { inline_keyboard: [[{ text: '🛑 Batalkan Radar', callback_data: 'cmd_stop_sniper' }]] };
 
         const MAX_BUY = 10; 
-        const maxRetries = 100; 
-        const sniperMarkup = { inline_keyboard: [[{ text: '🛑 Hentikan Sniper', callback_data: 'cmd_stop_sniper' }]] };
 
-        await safeEditMessageText(`🎯 *MESIN AUTO-SNIPER WA AKTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nMencari nomor WhatsApp pada *${activeAccs.length}* Akun API.\nTarget: ${MAX_BUY} Nomor WA...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup });
+        await safeEditMessageText(`🎯 *MESIN RADAR AUTO-BUYER AKTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nMemindai server untuk mencari Range WhatsApp terbaik...`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup });
 
-        const globalUniqueRanges = new Set(); 
-        const purchasedRanges = [];
-        let currentAccIndex = 0;
+        const watcherAcc = activeAccs[0][1]; 
+        const accId = activeAccs[0][0];
 
-        const watcherEntry = activeAccs.find(([, acc]) => acc.loggedIn);
-        if (!watcherEntry) return safeEditMessageText("⚠️ *TIDAK ADA AKUN API AKTIF*", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
-        const watcherAcc = watcherEntry[1];
+        // -- TAHAP 1: Kumpulkan Range Aktif --
+        const targetRanges = await watcherAcc.scanActiveRanges(10);
+        
+        if (targetRanges.length === 0) {
+            userStates[chatId].isSniperRunning = false;
+            return safeEditMessageText(`❌ *RADAR GAGAL*\nTidak ditemukan traffic WhatsApp di luar ID/MY saat ini.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
 
-        for (let i = 1; i <= maxRetries; i++) {
-            if (!userStates[chatId].isSniperRunning) {
-                await safeEditMessageText(`🛑 *SNIPER DIHENTIKAN MANUAL*\nAuto-sniper dibatalkan oleh admin pada iterasi ke-${i}.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
-                break;
-            }
+        let purchasedCount = 0;
+        let logText = `🎯 *RADAR SELESAI* (${targetRanges.length} Range)\nMemulai eksekusi borong nomor...\n\n`;
+        await safeEditMessageText(logText, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup });
 
-            if (i % 5 === 0 || i === 1) {
-                await safeEditMessageText(
-                    `🎯 *AUTO-SNIPER WA BERJALAN*\nIterasi: ${i}/${maxRetries}\nBerhasil Dibeli: ${purchasedRanges.length}/${MAX_BUY} Nomor\nAkun API Dipakai: ${activeAccs.length}`, 
-                    { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }
-                ).catch(()=>{});
-            }
-
-            const data = await watcherAcc.fetchLiveTestSMS();
+        // -- TAHAP 2: Eksekusi Add Number --
+        const newNumbers = [];
+        
+        for (const range of targetRanges) {
+            if (!userStates[chatId].isSniperRunning || purchasedCount >= MAX_BUY) break;
             
-            for (const item of data) {
-                if (!userStates[chatId].isSniperRunning) break;
+            logText += `\n🛒 *Range:* \`${range}\`\n`;
+            await safeEditMessageText(logText + `_Mengambil stok nomor..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
 
-                let sender = '';
-                try {
-                    const $orig = cheerio.load(item.originator);
-                    sender = $orig('p').text().trim().toLowerCase();
-                } catch(e) { sender = String(item.originator || '').toLowerCase(); }
-                const messageData = String(item.messagedata || '').toLowerCase();
-                
-                const isWAMessage = sender.includes('whatsapp') || sender.includes('wa') || 
-                                    messageData.includes('whatsapp') || messageData.includes('wa code') ||
-                                    messageData.includes('code') || messageData.includes('kode');
-
-                if (isWAMessage && !globalUniqueRanges.has(item.range)) {
-                    globalUniqueRanges.add(item.range);
-
-                    const [buyerId, buyerAcc] = activeAccs[currentAccIndex % activeAccs.length];
-                    
-                    await safeEditMessageText(
-                        `🎯 *TARGET TERKUNCI!*\nNegara: \`${item.range}\`\nMengeksekusi via Akun ID: \`${buyerId}\`...`, 
-                        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }
-                    ).catch(()=>{});
-
-                    const availableNums = await buyerAcc.getTestNumbersByRange(item.range);
-                    
-                    if (availableNums.length > 0) {
-                        const buyResult = await buyerAcc.addNumber(availableNums[0].id);
-                        
-                        if (buyResult && buyResult.message) {
-                            const resStr = buyResult.message.toLowerCase();
-                            if (resStr.includes('done') || resStr.includes('success') || resStr.includes('berhasil') || resStr.includes('added')) {
-                                purchasedRanges.push({ range: item.range, rate: availableNums[0].rate, accountId: buyerId });
-                                currentAccIndex++; 
-                                await safeEditMessageText(
-                                    `✅ *NOMOR WA DIBELI!*\nNegara: \`${item.range}\`\nAkun: \`${buyerId}\`\nTotal: ${purchasedRanges.length}/${MAX_BUY}`, 
-                                    { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }
-                                ).catch(()=>{});
-                                await delay(1000);
-                            } else {
-                                await safeEditMessageText(
-                                    `⚠️ *AKUN ${buyerId} GAGAL*\nAlasan: ${buyResult.message}\nMencoba akun berikutnya...`, 
-                                    { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }
-                                ).catch(()=>{});
-                                currentAccIndex++;
-                                globalUniqueRanges.delete(item.range);
-                                await delay(1500);
-                            }
-                        }
-                    } else {
-                        await safeEditMessageText(
-                            `⚠️ *KALAH CEPAT*\nStok \`${item.range}\` sudah habis.`, 
-                            { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }
-                        ).catch(()=>{});
-                        await delay(1000);
-                    }
-
-                    if (purchasedRanges.length >= MAX_BUY) break; 
-                }
+            // Ambil semua stok nomor di range ini (fungsi ini sudah bersih dari HTML)
+            const availableNums = await watcherAcc.getTestNumbersByRange(range);
+            
+            if (availableNums.length === 0) {
+                logText += `   └ ❌ Stok Kosong\n`;
+                continue;
             }
 
-            if (purchasedRanges.length >= MAX_BUY) break;
-            if (i < maxRetries && userStates[chatId].isSniperRunning) await delay(3000); 
+            for (const num of availableNums) {
+                if (!userStates[chatId].isSniperRunning || purchasedCount >= MAX_BUY) break;
+
+                const buyResult = await watcherAcc.addNumber(num.id);
+                const resMsg = buyResult?.message?.toLowerCase() || '';
+
+                if (resMsg.includes('done') || resMsg.includes('success') || resMsg.includes('berhasil')) {
+                    logText += `   └ ✅ +${num.number} (Sukses)\n`;
+                    purchasedCount++;
+                    newNumbers.push({ number: num.number, range: range });
+                } else {
+                    logText += `   └ ❌ +${num.number} (Gagal)\n`;
+                }
+                
+                await safeEditMessageText(logText, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: sniperMarkup }).catch(()=>{});
+                await delay(2000); 
+            }
         }
 
         userStates[chatId].isSniperRunning = false;
 
-        if (purchasedRanges.length > 0) {
-            let reply = `✅ *AUTO-SNIPER SELESAI*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nBerhasil memborong ${purchasedRanges.length} Nomor WA:\n\n`;
-            purchasedRanges.forEach((d, i) => { reply += `${i+1}. 🌍 *${d.range}* (Akun: \`${d.accountId}\`)\n   └ 💵 $${d.rate}\n\n`; });
-            await safeEditMessageText(reply + `⏳ _Sinkronisasi & Penyaringan Meta WA..._`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
+        // -- TAHAP 3: Validasi & Simpan DB --
+        if (newNumbers.length > 0) {
+            logText += `\n✅ *BERHASIL MEMBELI ${purchasedCount} NOMOR*\n⏳ _Menyimpan ke Database & Filter WA..._`;
+            await safeEditMessageText(logText, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' });
             
-            const successfulAccIds = [...new Set(purchasedRanges.map(p => p.accountId))];
-            for (const accId of successfulAccIds) {
-                const acc = activeSessions.get(accId);
-                if (!acc) continue;
-                const existingNums = await dbAll('SELECT number FROM wa_nodes WHERE account_id = ?', [accId]);
-                const existingSet = new Set(existingNums.map(n => n.number));
-                const allMyNumbers = await acc.getMyNumbers();
-                const newNumbers = allMyNumbers.filter(n => !existingSet.has(n.number));
-                if (newNumbers.length > 0) {
-                    await delay(1000);
-                    await autoFilterAndSaveNumbers(chatId, newNumbers, msgId, accId);
-                }
-            }
-            safeEditMessageText(reply + `*🔥 PANEL ADMIN BOT OTP*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }).catch(()=>{});
+            await autoFilterAndSaveNumbers(chatId, newNumbers, msgId, accId);
         } else {
-            safeEditMessageText(`❌ *AUTO-SNIPER BERHENTI*\nTidak ada nomor WhatsApp baru yang berhasil diamankan dari jaringan IVAS.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+            safeEditMessageText(logText + `\n❌ *TIDAK ADA NOMOR YANG TERBELI*`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         }
         return;
     }
 
-    // ── Hapus Nomor Mati ──
     if (action === 'cmd_clean_dead_nodes') {
         if (!sock?.authState?.creds?.registered) return safeEditMessageText("⚠️ *BOT WA TERPUTUS*\nDiperlukan koneksi WA untuk memverifikasi nomor.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
         const nodes = await dbAll('SELECT number FROM wa_nodes');
@@ -1093,7 +1095,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(`✅ *PEMBERSIHAN SELESAI*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 Total Diperiksa : ${nodes.length}\n🗑️ Dihapus : *${deadCount}* Nomor Mati\n🟢 Sisa Stok : ${nodes.length - deadCount}`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
 
-    // ── Reset Database ──
     if (action === 'cmd_delete_all') {
         return safeEditMessageText("⚠️ *KONFIRMASI RESET DATABASE*\nSeluruh nomor WA dari semua akun akan dikembalikan ke server (Purge).", { 
             chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', 
@@ -1113,7 +1114,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(`✅ *RESET SELESAI*\nDatabase lokal dikosongkan total.`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
 
-    // ── Status Server ──
     if (action === 'cmd_status') {
         const countRow = await dbGet('SELECT COUNT(*) as count FROM wa_nodes');
         const userCountRow = await dbGet('SELECT COUNT(*) as count FROM whitelisted_users');
@@ -1140,13 +1140,11 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText(statusMsg, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
     }
 
-    // ── Cari Riwayat OTP ──
     if (action === 'cmd_search') {
         userStates[chatId].state = 'WAITING_NUMBER';
         return safeEditMessageText(`🔍 *CARI RIWAYAT OTP*\nMasukkan nomor WhatsApp target\n(Contoh: \`628123456789\`)`, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
     }
 
-    // ── WA Login/Logout ──
     if (action === 'cmd_wa_login') {
         if (fs.existsSync('./auth_info_baileys/creds.json')) return bot.answerCallbackQuery(query.id, { text: 'Bot Filter WhatsApp sudah terhubung.', show_alert: true });
         userStates[chatId].state = 'WAITING_WA_PHONE';
@@ -1171,7 +1169,6 @@ bot.on('callback_query', async (query) => {
         return safeEditMessageText("🔥 *PANEL ADMIN BOT OTP* 🔥\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nOperasi dibatalkan.", { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() }); 
     }
 
-    // ── Bulk Check (dari file TXT) ──
     if (action.startsWith('start_')) {
         if (!sock?.authState?.creds?.registered) return bot.answerCallbackQuery(query.id, { text: '⚠️ Bot WhatsApp Filter belum terhubung!', show_alert: true });
         const parts = action.split('_'); 
@@ -1195,28 +1192,47 @@ bot.on('message', async (msg) => {
     if (!isAdmin(chatId) || !userStates[chatId]) return;
     const { state: currentState, lastMsgId: menuMsgId } = userStates[chatId];
 
-    if (currentState === 'WAITING_COOKIE') {
-        const parts = text.split('=');
-        if (parts.length >= 2) {
-            const name = parts[0].trim(); 
-            const value = parts.slice(1).join('=').trim();
-            if (!userStates[chatId].tempCookies) userStates[chatId].tempCookies = {};
-            userStates[chatId].tempCookies[name] = value;
-            const addedKeys = Object.keys(userStates[chatId].tempCookies).map(k => `\`${k}\``).join(', ');
-            safeEditMessageText(`🔑 *INPUT KREDENSIAL API*\n✅ Terbaca: ${addedKeys}\n\nLanjutkan kirim parameter lain, atau kirim label akun dengan format:\n\`label=NamaAkun\`\n\nLalu klik Eksekusi.`, { 
-                chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', 
-                reply_markup: { inline_keyboard: [ 
-                    [{ text: '✅ Eksekusi Login', callback_data: 'cmd_finish_login' }], 
-                    [{ text: '❌ Batal', callback_data: 'cmd_cancel' }] 
-                ]} 
+    if (currentState === 'WAITING_RAW_COOKIE') {
+        if (!text.includes('ivas_sms_session=')) {
+            return safeEditMessageText("❌ *FORMAT SALAH*\nCookie tidak valid. Pastikan teks mengandung `ivas_sms_session=`.", { 
+                chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() 
             });
-
-            if (name === 'label') userStates[chatId].tempLabel = value;
-
-        } else {
-            safeEditMessageText(`❌ *FORMAT SALAH*\nGunakan format \`key=value\``, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() });
         }
+        
+        userStates[chatId].tempCookies = text.trim();
+        userStates[chatId].state = 'WAITING_LABEL';
+        
+        return safeEditMessageText("✅ *COOKIE DITERIMA*\nSilakan kirimkan *Label / Nama* untuk akun ini (contoh: `Akun Utama`).", { 
+            chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getCancelMarkup() 
+        });
     } 
+
+    else if (currentState === 'WAITING_LABEL') {
+        const label = text.trim();
+        const cookiesStr = userStates[chatId].tempCookies;
+        userStates[chatId].state = 'IDLE'; 
+        
+        await safeEditMessageText("⏳ *MENYIMPAN AKUN API...*", { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown' });
+        
+        const res = await dbRun('INSERT INTO ivas_accounts (cookies, label, added_at) VALUES (?, ?, ?)', [cookiesStr, label, new Date().toISOString()]);
+        const accountId = res.lastID;
+        
+        const account = new IVASAccount(accountId, cookiesStr);
+        if (await account.initSession()) {
+            activeSessions.set(accountId, account);
+            const myNumbers = await account.getMyNumbers();
+            
+            if (myNumbers.length > 0) {
+                await autoFilterAndSaveNumbers(chatId, myNumbers, menuMsgId, accountId);
+            } else {
+                safeEditMessageText(`✅ *AKUN API BERHASIL DITAMBAHKAN*\nID Akun: \`${accountId}\` | Label: ${label}\nStok nomor bawaan: 0.`, { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+            }
+        } else {
+            await dbRun('DELETE FROM ivas_accounts WHERE id = ?', [accountId]);
+            safeEditMessageText("❌ *GAGAL AUTENTIKASI*\nCookie salah, diblokir Cloudflare, atau telah expired. Akun tidak disimpan.", { chat_id: chatId, message_id: menuMsgId, parse_mode: 'Markdown', reply_markup: getMainMenuMarkup() });
+        }
+        return;
+    }
 
     else if (currentState === 'WAITING_RANGE') {
         userStates[chatId].state = 'IDLE'; 
@@ -1347,8 +1363,19 @@ bot.on('document', async (msg) => {
     console.log('[SISTEM] Menyiapkan Basis Data Provider OTP...');
     const accounts = await dbAll('SELECT * FROM ivas_accounts');
     let loadedCount = 0;
+    
     for (const accData of accounts) {
-        const account = new IVASAccount(accData.id, JSON.parse(accData.cookies));
+        let cookieStr = accData.cookies;
+        
+        try {
+            const parsed = JSON.parse(cookieStr);
+            if (typeof parsed === 'object' && parsed !== null) {
+                cookieStr = parsed['Cookie'] || parsed['cookie'] || cookieStr;
+            }
+        } catch(e) {
+        }
+
+        const account = new IVASAccount(accData.id, cookieStr);
         if (await account.initSession()) {
             activeSessions.set(accData.id, account);
             loadedCount++;
@@ -1357,9 +1384,12 @@ bot.on('document', async (msg) => {
             console.log(`[API] Akun ID ${accData.id} GAGAL (expired/invalid).`);
         }
     }
+    
     console.log(`[SISTEM] ${loadedCount}/${accounts.length} Akun API aktif.`);
     pollAllAccounts();
+    
     console.log('[SISTEM] Memeriksa Modul WhatsApp...');
     if (fs.existsSync('./auth_info_baileys/creds.json')) startWA();
+    
     console.log('[SISTEM] Bot OTP siap melayani.');
 })();
